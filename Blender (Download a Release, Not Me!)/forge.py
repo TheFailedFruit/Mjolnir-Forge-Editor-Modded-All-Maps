@@ -779,7 +779,7 @@ def bitmapImage(bitmap_index, kind='color'):
     return img
 
 BASE_USAGES = ('base_map', 'change_color_map', 'foam_texture', 'alpha_mask_map', 'detail_map')
-MATERIAL_VERSION = 5  # 5: detail scale measured per texture, curve-based colour space. 4: 4: 3-channel self-illum. 2: detail maps, terrain blending, specular/roughness. 3: values tuned on Boneyard, self-illum modes. Older materials are rebuilt.
+MATERIAL_VERSION = 6  # 6: runtime-driven glows off at rest, glass. 5: 5: detail scale measured per texture, curve-based colour space. 4: 4: 3-channel self-illum. 2: detail maps, terrain blending, specular/roughness. 3: values tuned on Boneyard, self-illum modes. Older materials are rebuilt.
 DETAIL_MULTIPLIER = 4.59479  # Halo's detail scale (2.0 in gamma space) applied to linear colours
 
 def detailScale(*image_nodes):
@@ -1025,8 +1025,30 @@ def texturedMaterial(mat, shader_index, log=print):
         e_str = bsdfInput(bsdf, 'Emission Strength')
         if e_str is not None: e_str.default_value = max(0.0, min(20.0, scalar('self_illum_intensity', 1.0)))
 
+    # glows driven at runtime by the object (gun heat, damage, shield charge...) are off when it's at rest
+    dynamic = sorted({inp for _t, inp, _r in info.get('overlays', []) if inp and inp.lower() not in ('time', 'none', 'default')})
+    hidden = False
+    if dynamic:
+        mat['mjolnir_animated_inputs'] = ", ".join(dynamic)
+        if blend in ('additive', 'multiply', 'double_multiply'):
+            hidden = True
+        elif si_mode not in ('off', ''):
+            e_str = bsdfInput(bsdf, 'Emission Strength')
+            if e_str is not None: e_str.default_value = 0.0
+    # glass (Reach's glass shader, or a shader named as glass that isn't marked transparent)
+    if info.get('group') == 'rmgl' or ('glass' in mat.name.lower() and blend == 'opaque'):
+        if not bsdf.inputs['Alpha'].links: bsdf.inputs['Alpha'].default_value = 0.3
+        rough_in = bsdfInput(bsdf, 'Roughness')
+        if rough_in is not None: rough_in.default_value = 0.05
+        spec_in = bsdfInput(bsdf, 'Specular IOR Level', 'Specular')
+        if spec_in is not None and not spec_in.links: spec_in.default_value = 0.5
+        if blend == 'opaque': blend = 'alpha_blend'
     shader_out = bsdf.outputs['BSDF']
-    if blend in ('additive', 'multiply', 'double_multiply'):
+    if hidden:
+        tr = nodes.new('ShaderNodeBsdfTransparent'); tr.location = (300, 450)
+        shader_out = tr.outputs[0]
+        if blend == 'opaque': blend = 'additive'
+    elif blend in ('additive', 'multiply', 'double_multiply'):
         # glows / light cards: show the colour as light, let everything else through
         emit = nodes.new('ShaderNodeEmission'); emit.location = (300, 300)
         e_col = bsdfInput(bsdf, 'Emission Color', 'Emission')

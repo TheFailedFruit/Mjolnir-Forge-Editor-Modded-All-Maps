@@ -100,6 +100,9 @@ also exports every palette model as .obj. Add  --textures tex_folder  to save th
     --shared "C:\...\Halo The Master Chief Collection\haloreach\maps"
     python mjolnir_mapreader.py "C:\path\to\70_boneyard.map" --bsp level_folder
 exports the map's level geometry as .obj (default Blender OBJ import settings work).
+    python mjolnir_mapreader.py "C:\path\to\forge_halo.map" --object warthog
+prints the shaders of palette objects whose name contains the text (options, parameters, textures,
+and the inputs that animate them at runtime, e.g. gun heat).
     python mjolnir_mapreader.py "C:\path\to\70_boneyard.map" --lighting probe_folder
 prints the map's sky, level shader settings and baked lightmap textures (and saves what it can
 decode). Decoding textures from the command line needs numpy:  pip install numpy
@@ -111,7 +114,8 @@ Limits
 - Materials approximate Halo's shaders: base x detail maps x albedo tint, terrain layer blending,
   normal maps, specular strength/roughness, self-illumination, alpha test/blend. Team colour
   (change colour), cube-map reflections and detail normal maps aren't reproduced. Additive shaders
-  (glows) show as emission.
+  (glows) show as emission; glows the game drives at runtime (gun heat, damage) are off, as at
+  rest. Glass shaders show as see-through.
 - Baked lighting doesn't use the lightmap's directional detail for the indirect light, so bump detail
   in shade is flatter than in game; specular highlights aren't drawn on baked surfaces. Real-time
   object shadows on the level need EEVEE (Cycles shows the baked shadows only).

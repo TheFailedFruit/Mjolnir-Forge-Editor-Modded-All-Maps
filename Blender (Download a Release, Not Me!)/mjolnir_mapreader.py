@@ -1309,7 +1309,7 @@ def _shader_methods(cls):
             pass
 
         n_props, p_addr = self.block(m + SHADER_PROPERTIES)
-        if n_props == 0: return dict(textures={}, tints={}, params={}, options=options, group=t.group)
+        if n_props == 0: return dict(textures={}, tints={}, params={}, options=options, group=t.group, overlays=[])
         template = self.tag_ref(p_addr)
         n_maps, maps_addr = self.block(p_addr + 16)
         n_tile, tile_addr = self.block(p_addr + 28)
@@ -1320,6 +1320,14 @@ def _shader_methods(cls):
             args = [self.string(self.i32(a + 4 * i)) for i in range(n)]
             n, a = self.block(template.meta + RMT2_USAGES)
             usages = [self.string(self.i32(a + 4 * i)) for i in range(n)]
+        overlays = []
+        try:   # animated parameters: driven at runtime by object functions (heat, damage, shields...)
+            n_ov, ov_addr = self.block(p_addr + 0x5C)
+            for i in range(min(n_ov, 32)):
+                o = ov_addr + 0x24 * i
+                overlays.append((self.i32(o), self.string(self.i32(o + 4)), self.string(self.i32(o + 8))))
+        except MapReadError:
+            pass
         textures, tints, params = {}, {}, {}
         for i, usage in enumerate(usages):
             if i >= n_maps: break
@@ -1335,7 +1343,7 @@ def _shader_methods(cls):
             params[arg] = tiling[i]   # scalars use [0]; colours (r,g,b,a)
             if arg.endswith("_color") or arg.endswith("_tint"):
                 tints[arg] = tiling[i]
-        return dict(textures=textures, tints=tints, params=params, options=options, group=t.group)
+        return dict(textures=textures, tints=tints, params=params, options=options, group=t.group, overlays=overlays)
 
     def read_bitmap(self, tag_index, submap=0, max_size=4096, layer_offset=0):
         """Decode one bitmap (largest mip) to an RGBA uint8 numpy array (rows top to bottom).
@@ -2022,6 +2030,7 @@ def main(argv):
     ap.add_argument("--bsp", metavar="DIR", help="export the level geometry (clusters + instances) as .obj into DIR")
     ap.add_argument("--textures", metavar="DIR", help="with --obj: also save each model's textures as .png into DIR")
     ap.add_argument("--shared", metavar="DIR", help="folder containing shared.map (default: next to the map)")
+    ap.add_argument("--object", metavar="NAME", help="print the shaders (options, parameters, textures, animated inputs) of palette objects whose name contains NAME")
     ap.add_argument("--lightmap-dump", metavar="FILE", help="save the level's lightmap images, cluster geometry and lightmap coordinates to FILE (.npz) for analysis")
     ap.add_argument("--lighting", metavar="DIR", help="probe the map's sky, level shaders and baked lightmaps; writes what it can decode into DIR")
     a = ap.parse_args(argv)
@@ -2073,6 +2082,24 @@ def main(argv):
                     print("  cluster geometry spans", [(round(min(p[i] for p in pts), 1), round(max(p[i] for p in pts), 1)) for i in range(3)])
                     s0 = level["clusters"][0]
                     print(f"  first cluster section {s0}: {len(level['sections'][s0]['positions'])} verts, {len(level['sections'][s0]['triangles'])} tris")
+
+        if a.object:
+            seen = set()
+            for e in pal:
+                if a.object.lower() not in e["name"].lower() or e["tag_index"] < 0 or e["tag_index"] in seen: continue
+                seen.add(e["tag_index"])
+                try:
+                    model = c.read_object_model(e["tag_index"], e["variant"], log=print)
+                except Exception as ex:
+                    print(f"\n{e['name']}: model failed: {ex}"); continue
+                print(f"\n== 0x{e['id']:04X} {e['name']}  ({e['tag_path']})  parts: {', '.join(model['parts'])}")
+                for spath, sidx in model["shader_tags"].items():
+                    info = c.read_shader(sidx) or {}
+                    print(f"  shader {spath} [{info.get('group')}]")
+                    print(f"    maps {', '.join(info.get('textures', {}))}")
+                    print(f"    options {info.get('options')}")
+                    print(f"    params {dict((k, tuple(round(x, 3) for x in v)) for k, v in info.get('params', {}).items())}")
+                    if info.get("overlays"): print(f"    animated inputs {info['overlays']}")
 
         if a.lighting:
             probe_lighting(c, a.lighting)
