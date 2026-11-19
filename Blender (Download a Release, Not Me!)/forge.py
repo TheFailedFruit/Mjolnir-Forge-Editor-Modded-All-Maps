@@ -1108,7 +1108,7 @@ def mapTitle(key):
     return key.replace('_', ' ').title()
 
 def copySceneSettings(src, dst):
-    for prop in ('scaleConvention', 'readMapPalette', 'extractModels', 'extractTextures', 'importLevel', 'mapFileOverride', 'extraMapFolders', 'gameLighting', 'bakedLighting'):
+    for prop in ('scaleConvention', 'readMapPalette', 'extractModels', 'extractTextures', 'importLevel', 'mapFileOverride', 'extraMapFolders', 'gameLighting', 'bakedLighting', 'bakedBrightness'):
         try:
             if src.forge.is_property_set(prop):  # copy real choices only, so defaults stay defaults
                 setattr(dst.forge, prop, getattr(src.forge, prop))
@@ -1164,7 +1164,7 @@ def buildLevel(scene, title, log=print):
         log("Level %s: %d clusters, %d instances in %.1fs" % (level['name'], len(level['clusters']), len(level['instances']), time.time() - t0))
     return count
 
-LEVEL_VERSION = 3  # 2: large BSPs (>4096 buffers) + checked index decoding. 3: baked lightmaps. Older builds are rebuilt.
+LEVEL_VERSION = 4  # 2: large BSPs (>4096 buffers) + checked index decoding. 3: baked lightmaps. 4: lightmap exposure. Older builds are rebuilt.
 
 def bakedLightmap(level, log=print):
     """The level's baked lighting, if it can be used: (image, brightness, uv converter) or None.
@@ -1179,7 +1179,7 @@ def bakedLightmap(level, log=print):
         meshes += [dict(lightmap_uvs=i[4], triangles=level['sections'][i[1]]['triangles']) for i in level['instances'] if i[4] is not None]
         if not meshes: return None
         o = mapreader.lightmap_orientation(px, meshes)
-        log("Lightmap check %s: %s" % (level['name'], {k: o.get(k) for k in ('ok', 'score', 'baseline', 'blank', 'flip_u', 'v_from_top')}))
+        log("Lightmap check %s: %s" % (level['name'], {k: o.get(k) for k in ('ok', 'score', 'baseline', 'blank', 'flip_u', 'v_from_top', 'all')}))
         if not o['ok']:
             log("Baked lighting for %s didn't line up with the geometry; using sun lighting instead" % level['name'])
             return None
@@ -1192,8 +1192,22 @@ def bakedLightmap(level, log=print):
         if fu: uv[:, 0] = 1.0 - uv[:, 0]
         if vt: uv[:, 1] = 1.0 - uv[:, 1]   # Blender images start at the bottom row
         return uv
-    brightness = info.get('brightness') or 0.0
-    if not (0.5 < brightness < 64.0): brightness = 6.0
+    # exposure: scale so the average lit vertex gets about the light a sunny surface gets (1.0)
+    lums = []
+    for m in meshes:
+        uv = np.asarray(m['lightmap_uvs'], np.float32)
+        uv = uv[(uv >= 0).all(1) & (uv <= 1).all(1)]
+        if not len(uv): continue
+        u = 1.0 - uv[:, 0] if fu else uv[:, 0]
+        v = uv[:, 1] if vt else 1.0 - uv[:, 1]
+        H, W = px.shape[:2]
+        c = px[np.clip((v * H).astype(np.int64), 0, H - 1), np.clip((u * W).astype(np.int64), 0, W - 1), :3] / 255.0
+        c = np.where(c <= 0.04045, c / 12.92, ((c + 0.055) / 1.055) ** 2.4)
+        lums.append(c @ np.array([0.2126, 0.7152, 0.0722]))
+    mean = float(np.concatenate(lums).mean()) if lums else 0.0
+    tag_brightness = info.get('brightness') or 0.0
+    brightness = min(64.0, max(0.5, 1.0 / mean)) if mean > 1e-4 else 6.0
+    log("Baked lighting %s: average lightmap value %.3f, tag brightness %.2f, using x%.2f" % (level['name'], mean, tag_brightness, brightness))
     return img, brightness, convert
 
 def lightmappedMaterial(mat, img, brightness):
@@ -1216,7 +1230,9 @@ def lightmappedMaterial(mat, img, brightness):
     tex = nodes.new('ShaderNodeTexImage'); tex.image = img; tex.label = 'baked lightmap'; tex.location = (x - 500, y)
     links.new(uvn.outputs['UV'], tex.inputs['Vector'])
     scale = nodes.new('ShaderNodeVectorMath'); scale.operation = 'SCALE'; scale.location = (x - 200, y)
-    scale.label = 'Lightmap Brightness'; scale.inputs['Scale'].default_value = brightness
+    scale.label = 'Lightmap Brightness'; scale.name = 'Lightmap Brightness'
+    lm['mjolnir_lightmap_brightness'] = brightness
+    scale.inputs['Scale'].default_value = brightness * bpy.context.scene.forge.bakedBrightness
     links.new(tex.outputs['Color'], scale.inputs[0])
     mul = nodes.new('ShaderNodeVectorMath'); mul.operation = 'MULTIPLY'; mul.location = (x, y)
     if bsdf.inputs['Base Color'].links: links.new(bsdf.inputs['Base Color'].links[0].from_socket, mul.inputs[0])
@@ -1319,12 +1335,14 @@ def ensureMapScene(context, log=print):
     fixSceneTags()
     for sc in bpy.data.scenes:
         if sc.get('mjolnir_map') != key: continue
-        if sc.get('mjolnir_level_handmade') or sc.get('mjolnir_level_version', 1) >= LEVEL_VERSION:
+        baked = bool(context.scene.forge.bakedLighting)
+        if sc.get('mjolnir_level_handmade') or (sc.get('mjolnir_level_version', 1) >= LEVEL_VERSION and bool(sc.get('mjolnir_baked', baked)) == baked):
             return sc, 0
-        log("Rebuilding %s level (built by an older version)" % sc.name)
+        log("Rebuilding %s level" % sc.name)
         removeLevel(sc)
         built = buildLevel(sc, mapTitle(key), log)
         sc['mjolnir_level_version'] = LEVEL_VERSION
+        sc['mjolnir_baked'] = bool(context.scene.forge.bakedLighting)
         return sc, built
     cur = context.scene
     if key == 'forge_halo':  # forge.blend's own Forge World scene (hand-made level): adopt it
@@ -1342,6 +1360,7 @@ def ensureMapScene(context, log=print):
     sc.unit_settings.scale_length = cur.unit_settings.scale_length
     built = buildLevel(sc, title, log)
     sc['mjolnir_level_version'] = LEVEL_VERSION
+    sc['mjolnir_baked'] = bool(context.scene.forge.bakedLighting)
     return sc, built
 
 # ---- sky and lighting ------------------------------------------------------------------------
@@ -2568,18 +2587,24 @@ class ForgeCollectionPanel(bpy.types.Panel):
 class SetupGameLighting(Operator):
     bl_idname = 'forge.setup_game_lighting'
     bl_label = "Set Up Game Lighting"
-    bl_description = "Set up EEVEE lighting like the game (sun, sky-coloured ambient light, shadows, AO) and switch the viewport to show it. Adds the map's sky if the map file is known"
+    bl_description = "Apply the lighting settings: rebuild the level if Baked Lighting changed, add the map's sky, and set up EEVEE lighting like the game (sun, sky-coloured ambient light, shadows, AO) and switch the viewport to show it. Adds the map's sky if the map file is known"
     bl_options = {'REGISTER', 'UNDO'}
     def execute(self, context):
         mapScene, extra = None, ""
         key = mapKey() if palette.get('path') else ""
+        if key and palette.get('cache') is not None and context.scene.forge.importLevel:
+            try:  # rebuilds the level if Baked Lighting was switched since it was built
+                sc, built = ensureMapScene(context)
+                if built: extra = ", rebuilt %s level" % sc.name
+            except Exception as e:
+                extra = " (level rebuild failed: %s)" % e
         for sc in bpy.data.scenes:
             if key and sc.get('mjolnir_map') == key: mapScene = sc
         if mapScene is not None:
             try:
                 mapScene['mjolnir_sky_version'] = 0
                 n = ensureSky(mapScene)
-                if n: extra = ", sky: %d objects" % n
+                if n: extra += ", sky: %d objects" % n
             except Exception as e:
                 extra = " (sky failed: %s)" % e
         work = context.scene if not isMapScene(context.scene) else workScene(context)
@@ -2603,6 +2628,12 @@ class ForgeSceneProps(bpy.types.PropertyGroup):
         description="Give each map a scene with its level geometry read from the .map, and show it as the backdrop of the scene you import into")
     extractTextures: BoolProperty(name="Extract Textures", default=True,
         description="Read textures and shader colours from the .map for extracted models (stored inside the .blend)")
+    def UpdateBakedBrightness(self, context):
+        for m in bpy.data.materials:
+            n = m.node_tree.nodes.get('Lightmap Brightness') if m.get('mjolnir_lightmapped') and m.node_tree else None
+            if n is not None: n.inputs['Scale'].default_value = m.get('mjolnir_lightmap_brightness', 1.0) * self.bakedBrightness
+    bakedBrightness: FloatProperty(name="Baked Brightness", default=1.0, min=0.0, soft_max=4.0,
+        description="Brightness of the baked lighting (1 = automatic exposure)", update=UpdateBakedBrightness)
     bakedLighting: BoolProperty(name="Baked Lighting", default=True,
         description="Light the map's level geometry with its baked lightmaps from the .map, like the game (experimental). Off = sun lighting")
     gameLighting: BoolProperty(name="Game Lighting", default=True,
@@ -2632,15 +2663,18 @@ class ForgeScenePanel(bpy.types.Panel):
         col.prop(sceneProps, 'extractModels')
         col.prop(sceneProps, 'extractTextures')
         col.prop(sceneProps, 'importLevel')
-        row = col.row(align=True)
-        row.prop(sceneProps, 'gameLighting')
-        row.operator(SetupGameLighting.bl_idname, text="", icon='LIGHT_SUN')
-        col.prop(sceneProps, 'bakedLighting')
         col.prop(sceneProps, 'mapFileOverride')
         col.prop(sceneProps, 'extraMapFolders')
         col.prop(sceneProps, 'renderThumbnails')
         col.operator(ExtractPaletteModels.bl_idname, icon='IMPORT')
         col.operator(RenderMissingThumbnails.bl_idname, icon='IMAGE_DATA')
+        light = layout.box()
+        light.label(text="Lighting", icon='LIGHT_SUN')
+        light.prop(sceneProps, 'gameLighting')
+        light.prop(sceneProps, 'bakedLighting')
+        sub = light.column(); sub.enabled = sceneProps.bakedLighting
+        sub.prop(sceneProps, 'bakedBrightness', slider=True)
+        light.operator(SetupGameLighting.bl_idname, icon='LIGHT_SUN')
         if mapreader is None:
             box.label(text="mjolnir_mapreader.py not found", icon='ERROR')
         elif palette['path']:

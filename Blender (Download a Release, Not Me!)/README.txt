@@ -36,8 +36,8 @@ When you press File > Import > Forge Objects, Mjolnir now:
      Baked Lighting (experimental, on by default): the level is lit with the map's own baked lightmaps
      read from the .map, like the game. The importer first checks that the lightmap lines up with the
      geometry and falls back to sun lighting if it doesn't (the import log says which). Forge objects
-     are lit by the sun; rotate the "Sun" object to match the map's shadows. Each baked material has a
-     "Lightmap Brightness" node if the level looks too bright or dark.
+     are lit by the sun; rotate the "Sun" object to match the map's shadows. The exposure is set
+     automatically; use the Baked Brightness slider if the level looks too bright or dark.
 
 Models extracted by an earlier version of this patch are rebuilt automatically on the next import.
 
@@ -67,8 +67,11 @@ Settings  (Properties editor > Scene tab > Forge Scene > Map Palette)
   Extract Missing Models   on by default
   Extract Textures         on by default (turn off for faster, untextured models)
   Build Map Scene          on by default (off = no map geometry is built or switched)
-  Game Lighting            on by default: sky + EEVEE lighting on import (sun button = apply now)
+Lighting  (same panel, "Lighting" box)
+  Game Lighting            on by default: sky + EEVEE lighting on import
   Baked Lighting           on by default: level lit by the map's baked lightmaps (experimental)
+  Baked Brightness         1 = automatic exposure
+  Set Up Game Lighting     applies the above now (rebuilds the level if Baked Lighting was switched)
   Render Thumbnails        on by default (previews of newly extracted models for the search)
   Render Missing Thumbnails   renders previews for any palette item that has none
   Map File                 leave empty for auto-detect; set it if the wrong .map gets picked
