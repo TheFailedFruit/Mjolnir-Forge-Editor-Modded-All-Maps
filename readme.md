@@ -5,6 +5,7 @@ This fork reads what it needs straight from the `.map` file MCC has loaded, so *
 - **Models extracted automatically.** Objects with no mesh in `forge.blend` (vehicles, modded props) are built from the map's render models, including variant attachments and vehicle weapons. They also appear under Add > Forge Object.
 - **Textures.** Extracted models and levels get materials from the map's shaders: base map with tint, normal map, self-illumination, alpha. Images are packed into the .blend.
 - **Every map's level.** The first import on a map builds its textured level geometry into its own scene; your working scene shows it as the "Map" backdrop, the same way Forge World works. Outdated builds are rebuilt automatically.
+- **Game-like lighting and shading.** Import adds the map's sky and sets up EEVEE like the game: a shadow-casting sun, sky-tinted ambient light, ambient occlusion, viewport in Material Preview. Materials use detail maps, terrain layer blending and the shader's specular/roughness values. One button re-applies it.
 - **Search with previews.** Add > Forge Object... opens a searchable list with a large thumbnail of the selected item. Stock items ship with thumbnails; extracted models get one rendered automatically.
 - **Fixes:** Anvil scale convention now really defaults to 47X; scaled objects no longer import at 100% when something is selected; Anvil yellow-team and scale-zone rules; readable errors when ForgeBridge.dll fails.
 
@@ -15,6 +16,7 @@ Settings are under Properties > Scene > Forge Scene > Map Palette. If a model fa
 python mjolnir_mapreader.py path\to\map.map                       # palette with IDs and tag paths
 python mjolnir_mapreader.py path\to\map.map --obj out --textures tex   # palette models as .obj + textures as .png
 python mjolnir_mapreader.py path\to\map.map --bsp level             # level geometry as .obj
+python mjolnir_mapreader.py path\to\map.map --lighting probe        # sky, level shader settings, baked lightmap info
 ```
 
 Map file format knowledge is ported from [Reclaimer](https://github.com/Gravemind2401/Reclaimer) (GPL-3.0) and [Assembly](https://github.com/XboxChaos/Assembly)'s plugin definitions.

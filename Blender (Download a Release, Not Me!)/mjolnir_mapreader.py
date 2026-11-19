@@ -27,7 +27,7 @@ try:
 except ImportError:  # Blender always has numpy; plain Python may not
     np = None
 
-VERSION = "1.0"
+VERSION = "1.2"
 
 class MapReadError(Exception):
     pass
@@ -1175,6 +1175,8 @@ RMDF_CATEGORIES = 16
 # bitmap layout, MCC Reach (from Reclaimer HaloReach.BitmapTag)
 BITM_BITMAPS, BITM_RESOURCES, BITM_INTERLEAVED = 124, 168, 180
 BITM_DATA_SIZE = 56
+SCNR_SKIES = 0x88
+LBSP_PRIMARY_MAP, LBSP_INTENSITY_MAP = 0x1C, 0x2C
 
 BITMAP_FORMATS = {0: "A8", 1: "Y8", 2: "AY8", 3: "A8Y8", 6: "R5G6B5", 8: "A1R5G5B5", 9: "A4R4G4B4",
                   10: "X8R8G8B8", 11: "A8R8G8B8", 14: "DXT1", 15: "DXT3", 16: "DXT5", 22: "U8V8",
@@ -1206,7 +1208,7 @@ def _shader_methods(cls):
             pass
 
         n_props, p_addr = self.block(m + SHADER_PROPERTIES)
-        if n_props == 0: return dict(textures={}, tints={}, options=options)
+        if n_props == 0: return dict(textures={}, tints={}, params={}, options=options, group=t.group)
         template = self.tag_ref(p_addr)
         n_maps, maps_addr = self.block(p_addr + 16)
         n_tile, tile_addr = self.block(p_addr + 28)
@@ -1217,7 +1219,7 @@ def _shader_methods(cls):
             args = [self.string(self.i32(a + 4 * i)) for i in range(n)]
             n, a = self.block(template.meta + RMT2_USAGES)
             usages = [self.string(self.i32(a + 4 * i)) for i in range(n)]
-        textures, tints = {}, {}
+        textures, tints, params = {}, {}, {}
         for i, usage in enumerate(usages):
             if i >= n_maps: break
             bm = self.tag_ref(maps_addr + SHADER_MAP_SIZE * i)
@@ -1229,9 +1231,10 @@ def _shader_methods(cls):
             if mm and mm.group(1) not in textures: textures[mm.group(1)] = (bm.index, tile)
         for i, arg in enumerate(args):
             if arg in usages or i >= len(tiling): continue
+            params[arg] = tiling[i]   # scalars use [0]; colours (r,g,b,a)
             if arg.endswith("_color") or arg.endswith("_tint"):
                 tints[arg] = tiling[i]
-        return dict(textures=textures, tints=tints, options=options)
+        return dict(textures=textures, tints=tints, params=params, options=options, group=t.group)
 
     def read_bitmap(self, tag_index, submap=0, max_size=4096):
         """Decode one bitmap (largest mip) to an RGBA uint8 numpy array (rows top to bottom).
@@ -1269,8 +1272,36 @@ def _shader_methods(cls):
         pixels = decode_pixels(data[:need], width, height, fmt)
         return dict(width=width, height=height, format=fmt, curve=curve, pixels=pixels)
 
+    def bitmap_info(self, tag_index):
+        """Describe every image in a bitmap tag without decoding it (used by the lightmap probe)."""
+        t = self.tags.get(tag_index)
+        if t is None or t.meta is None: return []
+        n_bm, bm_addr = self.block(t.meta + BITM_BITMAPS)
+        out = []
+        for i in range(min(n_bm, 64)):
+            d = bm_addr + BITM_DATA_SIZE * i
+            code = self.i16(d + 8)
+            out.append(dict(index=i, width=self.i16(d), height=self.i16(d + 2), depth=self.u8(d + 4), type=self.u8(d + 6),
+                            format=BITMAP_FORMATS.get(code, f"code {code}"), curve=self.u8(d + 17),
+                            raw=self.read(d, 24).hex()))
+        return out
+
+    def skies(self):
+        """Sky object tags of the scenario (scnr Skies block, 0x30 per entry, sky object tagref at +0)."""
+        try:
+            n, addr = self.block(self.scenario.meta + SCNR_SKIES)
+        except MapReadError:
+            return []
+        out = []
+        for i in range(min(n, 16)):
+            t = self.tag_ref(addr + 0x30 * i)
+            if t is not None and t.meta is not None and t not in out: out.append(t)
+        return out
+
     cls.read_shader = read_shader
     cls.read_bitmap = read_bitmap
+    cls.bitmap_info = bitmap_info
+    cls.skies = skies
 _shader_methods(CacheFile)
 
 # ---- block compression decoders (numpy) ----
@@ -1593,6 +1624,60 @@ def locate_loaded_map(map_display_name=None, override=None, extra_dirs=(), log=_
 # Command line test
 # ---------------------------------------------------------------------------------------------
 
+def probe_lighting(c, out_dir):
+    """Diagnostics for sky / shading / lightmap support (output is meant to be shared for debugging)."""
+    os.makedirs(out_dir, exist_ok=True)
+    skies = c.skies()
+    print(f"\n== lighting probe: {len(skies)} sky object(s)")
+    for t in skies:
+        try:
+            model = c.read_object_model(t.index, "", log=print)
+            fn = os.path.join(out_dir, "sky_" + re.sub(r"[^\w\-.]+", "_", t.path.split("\\")[-1]) + ".obj")
+            write_obj(model, fn)
+            print(f"  sky {t.path}: {sum(len(m['triangles']) for m in model['meshes'])} triangles -> {fn}")
+            for spath, sidx in model["shader_tags"].items():
+                info = c.read_shader(sidx) or {}
+                print(f"    shader {spath} [{info.get('group')}]: {', '.join(info.get('textures', {}))} {info.get('options')}")
+        except Exception as ex:
+            print(f"  sky {t.path}: failed - {ex}")
+    for bsp, lm in c.structure_bsps():
+        print(f"\n  bsp {bsp.path}  lightmap data: {lm.path if lm else None}")
+        try:
+            n, addr = c.block(bsp.meta + c.bsp_layout()["shaders"])
+            for i in range(min(n, 12)):
+                t = c.tag_ref(addr + 44 * i)
+                if t is None: continue
+                info = c.read_shader(t.index) or {}
+                params = {k: tuple(round(x, 3) for x in v) for k, v in info.get("params", {}).items()}
+                print(f"    shader {t.path} [{info.get('group')}]: maps {', '.join(info.get('textures', {}))}")
+                print(f"      options {info.get('options')}")
+                print(f"      params {params}")
+        except Exception as ex:
+            print(f"    shaders failed: {ex}")
+        if lm is None: continue
+        for label, off in (("primary", LBSP_PRIMARY_MAP), ("intensity", LBSP_INTENSITY_MAP)):
+            try:
+                t = c.tag_ref(lm.meta + off)
+                print(f"    {label} map: {t.path if t else None} [{t.group if t else ''}]")
+                if t is None or t.group != "bitm": continue
+                imgs = c.bitmap_info(t.index)
+                print(f"      {len(imgs)} images")
+                for im in imgs[:6]: print("      ", im)
+                for im in imgs[:2]:
+                    try:
+                        bm = c.read_bitmap(t.index, im["index"])
+                        fn = os.path.join(out_dir, f"{label}_{bsp.path.split(chr(92))[-1]}_{im['index']}.png")
+                        write_png(bm["pixels"], fn); print(f"      decoded image {im['index']} -> {fn}")
+                    except Exception as ex:
+                        print(f"      image {im['index']}: not decoded ({ex})")
+            except Exception as ex:
+                print(f"    {label} map failed: {ex}")
+        try:
+            n, addr = c.block(lm.meta + 0xF4)
+            print(f"    per-instance lightmap texcoords: {n} entries")
+        except Exception as ex:
+            print(f"    per-instance texcoords failed: {ex}")
+
 def main(argv):
     import argparse
     ap = argparse.ArgumentParser(description="Inspect a Halo Reach MCC .map for the Mjolnir Forge Editor")
@@ -1601,6 +1686,7 @@ def main(argv):
     ap.add_argument("--bsp", metavar="DIR", help="export the level geometry (clusters + instances) as .obj into DIR")
     ap.add_argument("--textures", metavar="DIR", help="with --obj: also save each model's textures as .png into DIR")
     ap.add_argument("--shared", metavar="DIR", help="folder containing shared.map (default: next to the map)")
+    ap.add_argument("--lighting", metavar="DIR", help="probe the map's sky, level shaders and baked lightmaps; writes what it can decode into DIR")
     a = ap.parse_args(argv)
 
     path = a.map
@@ -1650,6 +1736,9 @@ def main(argv):
                     print("  cluster geometry spans", [(round(min(p[i] for p in pts), 1), round(max(p[i] for p in pts), 1)) for i in range(3)])
                     s0 = level["clusters"][0]
                     print(f"  first cluster section {s0}: {len(level['sections'][s0]['positions'])} verts, {len(level['sections'][s0]['triangles'])} tris")
+
+        if a.lighting:
+            probe_lighting(c, a.lighting)
 
         if a.obj:
             os.makedirs(a.obj, exist_ok=True)

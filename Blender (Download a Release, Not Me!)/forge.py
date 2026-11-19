@@ -755,7 +755,7 @@ def bitmapImage(bitmap_index, kind='color'):
     cache = palette['cache']
     tag = cache.tags.get(bitmap_index)
     if tag is None: raise ValueError("bitmap tag missing")
-    key = tag.path + ('|normal' if kind == 'normal' else '')
+    key = tag.path + ('|' + kind if kind != 'color' else '')
     for img in bpy.data.images:
         if img.get('mjolnir_bitmap') == key: return img
     bm = cache.read_bitmap(bitmap_index)
@@ -774,10 +774,24 @@ def bitmapImage(bitmap_index, kind='color'):
     return img
 
 BASE_USAGES = ('base_map', 'change_color_map', 'foam_texture', 'alpha_mask_map', 'detail_map')
+MATERIAL_VERSION = 2  # 2: detail maps, terrain blending, specular/roughness. Older materials are rebuilt.
+DETAIL_MULTIPLIER = 4.59479  # Halo's detail scale (2.0 in gamma space) applied to linear colours
+
+def bsdfInput(bsdf, *names):
+    for n in names:
+        s = bsdf.inputs.get(n)
+        if s is not None: return s
+    return None
+
+def materialVersion(mat):
+    v = mat.get('mjolnir_textured', 0)
+    try: return int(v)
+    except Exception: return 1
 
 def texturedMaterial(mat, shader_index, log=print):
-    """Rebuild a material's nodes from the shader tag: base map (with albedo tint), normal map, self illumination."""
-    if mat.get('mjolnir_textured') or not bpy.context.scene.forge.extractTextures: return False
+    """Rebuild a material's nodes from the shader tag: base x detail maps (with albedo tint), terrain layer
+    blending, normal map, specular/roughness from the shader's parameters, self illumination."""
+    if materialVersion(mat) >= MATERIAL_VERSION or not bpy.context.scene.forge.extractTextures: return False
     key = (palette['key'], shader_index)
     if key in palette['failed_shaders']: return False
     cache = palette['cache']
@@ -788,78 +802,179 @@ def texturedMaterial(mat, shader_index, log=print):
         palette['failed_shaders'].add(key)
         log("Shader %s unreadable: %s" % (mat.name, e)); return False
     tex, tints, opts = info['textures'], info['tints'], info['options']
+    params = info.get('params', {})
 
     if mat.node_tree is None: mat.use_nodes = True
     nodes, links = mat.node_tree.nodes, mat.node_tree.links
     nodes.clear()
-    out = nodes.new('ShaderNodeOutputMaterial'); out.location = (500, 0)
-    bsdf = nodes.new('ShaderNodeBsdfPrincipled'); bsdf.location = (100, 0)
-    uv = None
-    y = [300]
+    out = nodes.new('ShaderNodeOutputMaterial'); out.location = (700, 0)
+    bsdf = nodes.new('ShaderNodeBsdfPrincipled'); bsdf.location = (300, 0)
+    state = dict(uv=None, y=600)
+    images = {}
 
     def image_node(usage, kind):
-        nonlocal uv
+        if usage not in tex: return None
+        if (usage, kind) in images: return images[(usage, kind)]
         bitmap_index, tile = tex[usage]
         try: img = bitmapImage(bitmap_index, kind)
         except Exception as e:
             log("Texture %s for %s skipped: %s" % (usage, mat.name, e)); return None
         n = nodes.new('ShaderNodeTexImage'); n.image = img; n.label = usage
-        n.location = (-400, y[0]); y[0] -= 300
+        n.location = (-700, state['y']); state['y'] -= 280
         su, sv = (tile[0] or 1.0), (tile[1] or 1.0)
         if (su, sv) != (1.0, 1.0):
-            if uv is None:
-                uv = nodes.new('ShaderNodeTexCoord'); uv.location = (-1000, 0)
-            mp = nodes.new('ShaderNodeMapping'); mp.location = (-700, n.location.y)
+            if state['uv'] is None:
+                state['uv'] = nodes.new('ShaderNodeTexCoord'); state['uv'].location = (-1300, 0)
+            mp = nodes.new('ShaderNodeMapping'); mp.location = (-1000, n.location.y)
             mp.inputs['Scale'].default_value = (su, sv, 1.0)
             mp.inputs['Location'].default_value = (0.0, 1.0 - sv, 0.0)  # tile from the top edge like Halo
-            links.new(uv.outputs['UV'], mp.inputs['Vector'])
+            links.new(state['uv'].outputs['UV'], mp.inputs['Vector'])
             links.new(mp.outputs['Vector'], n.inputs['Vector'])
+        images[(usage, kind)] = n
         return n
+
+    def vmath(op, a, b=None, x=-200):
+        n = nodes.new('ShaderNodeVectorMath'); n.operation = op; n.location = (x, state['y'] + 140)
+        links.new(a, n.inputs[0])
+        if op == 'SCALE': n.inputs['Scale'].default_value = b
+        elif isinstance(b, (tuple, list)): n.inputs[1].default_value = b[:3]
+        elif b is not None: links.new(b, n.inputs[1])
+        return n.outputs['Vector']
+
+    def mix(fac, a, b, x=-100):
+        n = nodes.new('ShaderNodeMix'); n.data_type = 'RGBA'; n.blend_type = 'MIX'; n.location = (x, state['y'] + 140)
+        if isinstance(fac, float): n.inputs[0].default_value = fac
+        else: links.new(fac, n.inputs[0])
+        links.new(a, n.inputs[6]); links.new(b, n.inputs[7])
+        return n.outputs[2]
+
+    def math(op, a, b, x=-300):
+        n = nodes.new('ShaderNodeMath'); n.operation = op; n.location = (x, state['y'] + 140)
+        for i, v in enumerate((a, b)):
+            if isinstance(v, (int, float)): n.inputs[i].default_value = v
+            else: links.new(v, n.inputs[i])
+        return n.outputs[0]
+
+    def scalar(name, default):
+        v = params.get(name)
+        return float(v[0]) if v else default
+
+    def detailed(base, suffix=""):
+        """base colour x detail map(s) x 4.59, as Halo's albedo options do."""
+        color = base.outputs['Color']
+        albedo = opts.get('albedo', 'default')
+        d1 = image_node('detail_map' + suffix, 'color')
+        d2 = image_node('detail_map2' + suffix, 'color') if 'detail_map2' + suffix in tex else None
+        if d1 is not None and d2 is not None and 'blend' in albedo:
+            det = mix(base.outputs['Alpha'], d1.outputs['Color'], d2.outputs['Color'])
+            color = vmath('SCALE', vmath('MULTIPLY', color, det), DETAIL_MULTIPLIER)
+        else:
+            for d in (d1, d2, image_node('detail_map_overlay' + suffix, 'color')):
+                if d is not None: color = vmath('SCALE', vmath('MULTIPLY', color, d.outputs['Color']), DETAIL_MULTIPLIER)
+        return color
 
     tint = tints.get('albedo_color')
     tint_rgb = (tint[0], tint[1], tint[2], 1.0) if tint else None
-    base_usage = next((u for u in BASE_USAGES if u in tex), None)
-    base = image_node(base_usage, 'color') if base_usage else None
     blend = opts.get('blend_mode', 'opaque')
     alpha_test = opts.get('alpha_test', 'none') not in ('none', 'off', '')
+    base = None
+    normal_color = None
+    spec_mask = None
+
+    layers = [k for k in range(4) if 'base_map_m_%d' % k in tex and opts.get('material_%d' % k, 'on') != 'off']
+    blend_map = image_node('blend_map', 'data') if layers and 'blend_map' in tex else None
+    if blend_map is not None:
+        # terrain: up to 4 materials weighted by the blend map's R, G, B, A (normalised)
+        sep = nodes.new('ShaderNodeSeparateColor') if hasattr(bpy.types, 'ShaderNodeSeparateColor') else nodes.new('ShaderNodeSeparateRGB')
+        sep.location = (-450, state['y'])
+        links.new(blend_map.outputs['Color'], sep.inputs[0])
+        weights = [sep.outputs[0], sep.outputs[1], sep.outputs[2], blend_map.outputs['Alpha']]
+        acc_c = acc_n = total = None
+        for k in layers:
+            b_img = image_node('base_map_m_%d' % k, 'color')
+            if b_img is None: continue
+            c = detailed(b_img, '_m_%d' % k)
+            n_img = image_node('bump_map_m_%d' % k, 'normal')
+            n = n_img.outputs['Color'] if n_img is not None else None
+            w = weights[k]
+            if acc_c is None:
+                acc_c, acc_n, total = c, n, math('ADD', w, 0.0001)
+                continue
+            total = math('ADD', total, w)
+            f = math('DIVIDE', w, total)
+            acc_c = mix(f, acc_c, c)
+            if n is not None:
+                acc_n = mix(f, acc_n, n) if acc_n is not None else n
+        if acc_c is not None:
+            base = b_img
+            color = acc_c
+            normal_color = acc_n
+    if base is None:
+        base_usage = next((u for u in BASE_USAGES if u in tex), None)
+        base = image_node(base_usage, 'color') if base_usage else None
+        if base is not None:
+            color = detailed(base) if base_usage == 'base_map' else base.outputs['Color']
+        n_img = image_node('bump_map', 'normal')
+        if n_img is not None: normal_color = n_img.outputs['Color']
 
     if base is not None:
-        color = base.outputs['Color']
         if tint_rgb and tint_rgb[:3] != (1.0, 1.0, 1.0):
-            mix = nodes.new('ShaderNodeMix'); mix.data_type = 'RGBA'; mix.blend_type = 'MULTIPLY'
-            mix.location = (-150, 250); mix.inputs[0].default_value = 1.0
-            links.new(color, mix.inputs[6]); mix.inputs[7].default_value = tint_rgb
-            color = mix.outputs[2]
+            color = vmath('MULTIPLY', color, tint_rgb)
         links.new(color, bsdf.inputs['Base Color'])
         if alpha_test or blend in ('alpha_blend', 'pre_multiplied_alpha'):
             links.new(base.outputs['Alpha'], bsdf.inputs['Alpha'])
+        mat.diffuse_color = tint_rgb or (0.8, 0.8, 0.8, 1.0)   # solid-view colour
     else:
         rgb = tint_rgb or shaderColor(mat.name)
         bsdf.inputs['Base Color'].default_value = rgb
-    if base is not None: mat.diffuse_color = tint_rgb or (0.8, 0.8, 0.8, 1.0)   # solid-view colour
-    else: mat.diffuse_color = tuple(bsdf.inputs['Base Color'].default_value)
+        mat.diffuse_color = tuple(bsdf.inputs['Base Color'].default_value)
 
-    if 'bump_map' in tex:
-        n = image_node('bump_map', 'normal')
-        if n is not None:
-            nm = nodes.new('ShaderNodeNormalMap'); nm.location = (-150, -250)
-            links.new(n.outputs['Color'], nm.inputs['Color'])
-            links.new(nm.outputs['Normal'], bsdf.inputs['Normal'])
+    if normal_color is not None:
+        nm = nodes.new('ShaderNodeNormalMap'); nm.location = (50, -350)
+        links.new(normal_color, nm.inputs['Color'])
+        links.new(nm.outputs['Normal'], bsdf.inputs['Normal'])
 
-    if 'self_illum_map' in tex:
-        n = image_node('self_illum_map', 'color')
-        if n is not None:
-            links.new(n.outputs['Color'], bsdf.inputs['Emission Color'])
-            bsdf.inputs['Emission Strength'].default_value = 1.0
+    # specular: Halo's material model -> Principled specular level and roughness
+    model = opts.get('material_model', opts.get('specular', ''))
+    spec_in = bsdfInput(bsdf, 'Specular IOR Level', 'Specular')
+    rough_in = bsdfInput(bsdf, 'Roughness')
+    if 'diffuse_only' in model or model in ('none', 'off'):
+        level, rough = 0.0, 1.0
+    else:
+        coef = scalar('specular_coefficient', scalar('specular_coefficient_m_0', 0.1 if blend_map is not None else 0.2))
+        level = max(0.0, min(1.0, coef * 2.5))
+        rough = max(0.05, min(1.0, scalar('roughness', scalar('roughness_m_0', 0.4))))
+        if blend_map is not None: level *= 0.5
+    if spec_in is not None:
+        mask_opt = opts.get('specular_mask', '')
+        if level > 0 and base is not None and blend_map is None and 'from_diffuse' in mask_opt and not alpha_test:
+            links.new(math('MULTIPLY', base.outputs['Alpha'], level), spec_in)
+        elif level > 0 and 'texture' in mask_opt and 'specular_mask_texture' in tex:
+            m_img = image_node('specular_mask_texture', 'data')
+            if m_img is not None: links.new(math('MULTIPLY', m_img.outputs['Color'], level), spec_in)
+            else: spec_in.default_value = level
+        else:
+            spec_in.default_value = level
+    if rough_in is not None: rough_in.default_value = rough
+
+    si = image_node('self_illum_map', 'color')
+    if si is not None:
+        emit = si.outputs['Color']
+        st = tints.get('self_illum_color')
+        if st and tuple(st[:3]) != (1.0, 1.0, 1.0): emit = vmath('MULTIPLY', emit, tuple(st))
+        e_col = bsdfInput(bsdf, 'Emission Color', 'Emission')
+        if e_col is not None: links.new(emit, e_col)
+        e_str = bsdfInput(bsdf, 'Emission Strength')
+        if e_str is not None: e_str.default_value = max(0.0, min(20.0, scalar('self_illum_intensity', 1.0)))
 
     shader_out = bsdf.outputs['BSDF']
     if blend in ('additive', 'multiply', 'double_multiply'):
         # glows / light cards: show the colour as light, let everything else through
-        emit = nodes.new('ShaderNodeEmission'); emit.location = (100, 300)
-        if base is not None: links.new(bsdf.inputs['Base Color'].links[0].from_socket, emit.inputs['Color'])
+        emit = nodes.new('ShaderNodeEmission'); emit.location = (300, 300)
+        if bsdf.inputs['Base Color'].links: links.new(bsdf.inputs['Base Color'].links[0].from_socket, emit.inputs['Color'])
         else: emit.inputs['Color'].default_value = bsdf.inputs['Base Color'].default_value
-        tr = nodes.new('ShaderNodeBsdfTransparent'); tr.location = (100, 450)
-        add = nodes.new('ShaderNodeAddShader'); add.location = (300, 300)
+        tr = nodes.new('ShaderNodeBsdfTransparent'); tr.location = (300, 450)
+        add = nodes.new('ShaderNodeAddShader'); add.location = (500, 300)
         links.new(emit.outputs[0], add.inputs[0]); links.new(tr.outputs[0], add.inputs[1])
         shader_out = add.outputs[0]
     links.new(shader_out, out.inputs['Surface'])
@@ -869,19 +984,19 @@ def texturedMaterial(mat, shader_index, log=print):
             try: mat.blend_method = 'BLEND'
             except Exception: pass
 
-    mat['mjolnir_textured'] = True
+    mat['mjolnir_textured'] = MATERIAL_VERSION
     mat['mjolnir_shader_options'] = ", ".join("%s=%s" % kv for kv in opts.items())
     return True
 
 def upgradeMaterials():
-    """Give flat-coloured materials from earlier imports their textures."""
+    """Give flat-coloured materials (or ones built by an older version) their textures and shading."""
     cache = palette['cache']
     if cache is None or not bpy.context.scene.forge.extractTextures: return 0
     by_path = None
     done = 0
     for mat in bpy.data.materials:
         path = mat.get('mjolnir_shader')
-        if not path or mat.get('mjolnir_textured'): continue
+        if not path or materialVersion(mat) >= MATERIAL_VERSION: continue
         if by_path is None:
             by_path = {t.path: t.index for g, ts in cache.tags_by_group.items() if g.startswith('rm') for t in ts}
         idx = by_path.get(path)
@@ -1093,6 +1208,177 @@ def ensureMapScene(context, log=print):
     sc['mjolnir_level_version'] = LEVEL_VERSION
     return sc, built
 
+# ---- sky and lighting ------------------------------------------------------------------------
+SKY_VERSION = 1
+LIGHTING_VERSION = 1
+SKY_DEFAULT_COLOR = (0.42, 0.55, 0.75)
+
+def skyMaterial(mat):
+    """Unlit copy of a material for the sky: its colour is shown as-is, like the game draws skies."""
+    key = 'sky|' + mat.name
+    for m in bpy.data.materials:
+        if m.get('mjolnir_sky_of') == key: return m
+    sky = mat.copy(); sky.name = mat.name + " (sky)"
+    sky['mjolnir_sky_of'] = key
+    if sky.node_tree is None: return sky
+    nodes, links = sky.node_tree.nodes, sky.node_tree.links
+    bsdf = next((n for n in nodes if n.type == 'BSDF_PRINCIPLED'), None)
+    out = next((n for n in nodes if n.type == 'OUTPUT_MATERIAL'), None)
+    if bsdf is None or out is None: return sky
+    emit = nodes.new('ShaderNodeEmission'); emit.location = (bsdf.location.x, bsdf.location.y - 500)
+    src = bsdf.inputs['Base Color'].links
+    if src: links.new(src[0].from_socket, emit.inputs['Color'])
+    else: emit.inputs['Color'].default_value = bsdf.inputs['Base Color'].default_value
+    surf = out.inputs['Surface']
+    if surf.links and surf.links[0].from_node.type == 'ADD_SHADER': pass  # additive layers (clouds/glow) stay as they are
+    else: links.new(emit.outputs[0], surf)
+    return sky
+
+def imageAverage(img):
+    try:
+        px = np.empty(len(img.pixels), np.float32); img.pixels.foreach_get(px)
+        px = px.reshape(-1, 4)
+        px = px[::max(1, len(px) // 4096), :3]
+        if img.colorspace_settings.name == 'sRGB':  # stored values are sRGB-encoded; world colour is linear
+            px = np.where(px <= 0.04045, px / 12.92, ((px + 0.055) / 1.055) ** 2.4)
+        return tuple(float(v) for v in px.mean(axis=0))
+    except Exception:
+        return None
+
+def skyColor(objs):
+    """Average colour of the sky's textures: used as the world (ambient) light."""
+    cols = []
+    for ob in objs:
+        for slot in getattr(ob, 'material_slots', []):
+            m = slot.material
+            if m is None or m.node_tree is None: continue
+            for n in m.node_tree.nodes:
+                if n.type == 'TEX_IMAGE' and n.image is not None and n.label in ('base_map', 'detail_map', ''):
+                    c = imageAverage(n.image)
+                    if c: cols.append(c)
+    if not cols: return None
+    return tuple(sum(c[i] for c in cols) / len(cols) for i in range(3))
+
+def buildSky(scene, log=print):
+    """Add the scenario's sky objects to a map scene (unlit, no shadows, unselectable). Returns the sky objects."""
+    cache = palette['cache']
+    level = levelCollection(scene)
+    if cache is None or level is None: return []
+    for c in list(level.children):
+        if c.get('mjolnir_sky'):
+            for ob in list(c.objects): bpy.data.objects.remove(ob, do_unlink=True)
+            bpy.data.collections.remove(c)
+    made = []
+    skies = cache.skies()
+    if not skies: return []
+    coll = bpy.data.collections.new("%s Sky" % scene.name)
+    coll['mjolnir_sky'] = True
+    level.children.link(coll)
+    coll.hide_select = True
+    for t in skies:
+        try:
+            model = cache.read_object_model(t.index, "", log=log)
+            if model is None or not model['meshes']: continue
+            me = buildModelMesh("sky " + t.path.replace('\\', '/').split('/')[-1], model)
+            for i, m in enumerate(me.materials):
+                if m is not None: me.materials[i] = skyMaterial(m)
+            ob = bpy.data.objects.new(me.name, me)  # sky geometry is in world space, like the level
+            for attr in ('visible_shadow',):
+                try: setattr(ob, attr, False)
+                except Exception: pass
+            try: ob.display.show_shadows = False
+            except Exception: pass
+            coll.objects.link(ob)
+            made.append(ob)
+        except Exception as e:
+            log("Sky %s skipped: %s" % (t.path, e))
+    col = skyColor(made)
+    if col is not None: scene['mjolnir_sky_color'] = col
+    return made
+
+def ensureSky(scene, log=print):
+    if scene is None or scene.get('mjolnir_sky_version', 0) >= SKY_VERSION: return 0
+    made = buildSky(scene, log)
+    scene['mjolnir_sky_version'] = SKY_VERSION
+    return len(made)
+
+def setEnum(owner, prop, *values):
+    """Set an enum property to the first value this Blender version has."""
+    try: items = [i.identifier for i in owner.bl_rna.properties[prop].enum_items]
+    except Exception: return False
+    for v in values:
+        if v in items:
+            try: setattr(owner, prop, v); return True
+            except Exception: pass
+    return False
+
+def trySet(owner, **props):
+    for k, v in props.items():
+        try: setattr(owner, k, v)
+        except Exception: pass
+
+def lightingWorld(color):
+    w = bpy.data.worlds.get('Mjolnir Game Lighting') or bpy.data.worlds.new('Mjolnir Game Lighting')
+    w.use_nodes = True
+    nodes, links = w.node_tree.nodes, w.node_tree.links
+    nodes.clear()
+    out = nodes.new('ShaderNodeOutputWorld'); out.location = (300, 0)
+    bg = nodes.new('ShaderNodeBackground'); bg.location = (0, 0)
+    bg.inputs['Color'].default_value = tuple(color) + (1.0,)
+    bg.inputs['Strength'].default_value = 1.0
+    links.new(bg.outputs[0], out.inputs['Surface'])
+    w.color = color
+    return w
+
+def lightingSun(scene):
+    sun = next((o for o in scene.objects if o.get('mjolnir_sun')), None)
+    if sun is None:
+        data = bpy.data.lights.new('Sun', 'SUN')
+        sun = bpy.data.objects.new('Sun', data)
+        sun['mjolnir_sun'] = True
+        sun.rotation_euler = (radians(40), 0.0, radians(35))
+        scene.collection.objects.link(sun)
+    trySet(sun.data, energy=3.5, angle=radians(1.5), color=(1.0, 0.95, 0.88), use_shadow=True)
+    trySet(sun.data, shadow_cascade_max_distance=600.0, shadow_cascade_count=4)
+    return sun
+
+def setupLighting(context, scene, mapScene=None, force=False):
+    """Make the scene look like the game: EEVEE, a sun with shadows, ambient light from the sky's colour,
+    ambient occlusion, and the viewport switched to show it. Applied once per scene unless forced."""
+    if not force and scene.get('mjolnir_lighting_version', 0) >= LIGHTING_VERSION: return False
+    color = None
+    if mapScene is not None and mapScene.get('mjolnir_sky_color'): color = tuple(mapScene['mjolnir_sky_color'])
+    color = color or SKY_DEFAULT_COLOR
+    ambient = tuple(max(0.05, min(1.0, c)) * 0.8 for c in color)
+    world = lightingWorld(ambient)
+    for sc in (scene, mapScene):
+        if sc is None: continue
+        sc.world = world
+        setEnum(sc.render, 'engine', 'BLENDER_EEVEE_NEXT', 'BLENDER_EEVEE')
+        ee = sc.eevee
+        # Blender < 4.2: AO / soft shadows / bloom. 4.2+: screen-space ray tracing gives the AO and bounce light
+        trySet(ee, use_gtao=True, gtao_distance=2.0, use_soft_shadows=True, shadow_cascade_size='2048',
+               use_shadows=True, use_bloom=True, bloom_intensity=0.03)
+        trySet(ee, use_raytracing=True, ray_tracing_method='SCREEN', use_fast_gi=True, fast_gi_distance=4.0)
+        setEnum(sc.view_settings, 'view_transform', 'AgX', 'Filmic')
+        setEnum(sc.view_settings, 'look', 'AgX - Punchy', 'Punchy', 'Filmic - Medium High Contrast', 'Medium High Contrast')
+        trySet(sc.view_settings, exposure=0.0)
+    lightingSun(scene)
+    if mapScene is not None and mapScene != scene: lightingSun(mapScene)
+    try:
+        for area in context.screen.areas:
+            if area.type != 'VIEW_3D': continue
+            for space in area.spaces:
+                if space.type != 'VIEW_3D': continue
+                sh = space.shading
+                if sh.type in ('SOLID', 'WIREFRAME'): sh.type = 'MATERIAL'
+                trySet(sh, use_scene_lights=True, use_scene_world=True)
+                if space.clip_end < 5000: trySet(space, clip_end=20000.0)
+    except Exception:
+        pass
+    scene['mjolnir_lighting_version'] = LIGHTING_VERSION
+    return True
+
 MODEL_VERSION = 2  # 2: whole objects with variant attachments and vehicle weapons
 
 def objectMesh(itemName, entry, log=print):
@@ -1219,6 +1505,10 @@ def importForgeObjects(context, self=None, createCollections=False):
             if sc is not None:
                 showMap(work, sc)
                 if built: levelMsg = ", built %s level (%d objects)" % (sc.name, built)
+                if context.scene.forge.gameLighting:
+                    skies = ensureSky(sc)
+                    if skies: levelMsg += ", sky added"
+                    if setupLighting(context, work, sc): levelMsg += ", game lighting set up"
         except Exception as e:
             traceback.print_exc()
             levelMsg = " (level geometry failed: %s)" % e
@@ -2120,6 +2410,28 @@ class ForgeCollectionPanel(bpy.types.Panel):
         collProps = context.collection.forge
         layout.prop(collProps, 'icon')
 
+class SetupGameLighting(Operator):
+    bl_idname = 'forge.setup_game_lighting'
+    bl_label = "Set Up Game Lighting"
+    bl_description = "Set up EEVEE lighting like the game (sun, sky-coloured ambient light, shadows, AO) and switch the viewport to show it. Adds the map's sky if the map file is known"
+    bl_options = {'REGISTER', 'UNDO'}
+    def execute(self, context):
+        mapScene, extra = None, ""
+        key = mapKey() if palette.get('path') else ""
+        for sc in bpy.data.scenes:
+            if key and sc.get('mjolnir_map') == key: mapScene = sc
+        if mapScene is not None:
+            try:
+                mapScene['mjolnir_sky_version'] = 0
+                n = ensureSky(mapScene)
+                if n: extra = ", sky: %d objects" % n
+            except Exception as e:
+                extra = " (sky failed: %s)" % e
+        work = context.scene if not isMapScene(context.scene) else workScene(context)
+        setupLighting(context, work, mapScene, force=True)
+        self.report({'INFO'}, "Game lighting set up%s" % extra)
+        return {'FINISHED'}
+
 class ForgeSceneProps(bpy.types.PropertyGroup):
     def UpdateScaleConvention(self, context):
         for blobj in context.scene.objects:
@@ -2136,6 +2448,8 @@ class ForgeSceneProps(bpy.types.PropertyGroup):
         description="Give each map a scene with its level geometry read from the .map, and show it as the backdrop of the scene you import into")
     extractTextures: BoolProperty(name="Extract Textures", default=True,
         description="Read textures and shader colours from the .map for extracted models (stored inside the .blend)")
+    gameLighting: BoolProperty(name="Game Lighting", default=True,
+        description="On import, add the map's sky and set up EEVEE lighting (sun, sky-coloured ambient light, shadows, AO) so it looks closer to the game")
     mapFileOverride: StringProperty(name="Map File", subtype='FILE_PATH', default="",
         description="Leave empty to detect automatically. Set this if the wrong .map is picked")
     extraMapFolders: StringProperty(name="Mod Folders", default="",
@@ -2161,6 +2475,9 @@ class ForgeScenePanel(bpy.types.Panel):
         col.prop(sceneProps, 'extractModels')
         col.prop(sceneProps, 'extractTextures')
         col.prop(sceneProps, 'importLevel')
+        row = col.row(align=True)
+        row.prop(sceneProps, 'gameLighting')
+        row.operator(SetupGameLighting.bl_idname, text="", icon='LIGHT_SUN')
         col.prop(sceneProps, 'mapFileOverride')
         col.prop(sceneProps, 'extraMapFolders')
         col.prop(sceneProps, 'renderThumbnails')
@@ -2287,7 +2604,7 @@ class ScaleObjects(Operator):
         return {'FINISHED'}
 
 reg_classes = [
-    ForgeObjectProps, ForgeCollectionProps, ForgeSceneProps, ForgeSearchItem, ForgeSearchState, FORGE_UL_search,
+    ForgeObjectProps, ForgeCollectionProps, ForgeSceneProps, SetupGameLighting, ForgeSearchItem, ForgeSearchState, FORGE_UL_search,
     ImportForgeObjects, ExportForgeObjects, AddForgeObject, ConvertForge, SetupArray, ErrorMessage, ScaleObjects, ExtractPaletteModels, RotateForgeModel,
     RenderMissingThumbnails,
     ForgeObjectPanel, ForgeObjectPanel_Sidebar, AddForgeObjectMenu, ForgeCollectionPanel, ForgeScenePanel
