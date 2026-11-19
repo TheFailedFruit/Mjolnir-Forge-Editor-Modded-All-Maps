@@ -1145,6 +1145,7 @@ def copySceneSettings(src, dst):
 def buildLevel(scene, title, log=print):
     """Create the level geometry (clusters + instanced geometry) of every BSP into scene. Returns object count."""
     cache = palette['cache']
+    if 'mjolnir_ambient' in scene: del scene['mjolnir_ambient']
     root = bpy.data.collections.new("%s Level" % title)
     root['mjolnir_level'] = True
     scene.collection.children.link(root)
@@ -1159,7 +1160,7 @@ def buildLevel(scene, title, log=print):
         coll = bpy.data.collections.new(level['name'])
         root.children.link(coll)
         tags = level['shader_tags']
-        baked = bakedLightmap(level, log)   # (image, brightness, uv converter) or None
+        baked = bakedLightmap(level, log, scene)   # (image, brightness, uv converter) or None
         def lit(mesh, luv):
             if baked is None or luv is None: return None
             mesh = dict(mesh); mesh['lightmap_uvs'] = baked[2](luv); return mesh
@@ -1216,9 +1217,9 @@ def buildLevel(scene, title, log=print):
         pass
     return count
 
-LEVEL_VERSION = 6  # 6: clusters decide lightmap orientation. 5: 5: lightmap orientation fixed. 2: large BSPs (>4096 buffers) + checked index decoding. 3: baked lightmaps. 4: lightmap exposure. Older builds are rebuilt.
+LEVEL_VERSION = 7  # 7: stores the level's ambient light for lighting objects. 6: 6: clusters decide lightmap orientation. 5: 5: lightmap orientation fixed. 2: large BSPs (>4096 buffers) + checked index decoding. 3: baked lightmaps. 4: lightmap exposure. Older builds are rebuilt.
 
-def bakedLightmap(level, log=print):
+def bakedLightmap(level, log=print, scene=None):
     """The level's baked lighting, if it can be used: (image, brightness, uv converter) or None.
     Checks that the lightmap coordinates line up with the lightmap image before using it."""
     info = level.get('lightmap')
@@ -1248,7 +1249,7 @@ def bakedLightmap(level, log=print):
         if vt: uv[:, 1] = 1.0 - uv[:, 1]   # Blender images start at the bottom row
         return uv
     # exposure: scale so the average lit vertex gets about the light a sunny surface gets (1.0)
-    lums = []
+    lums, cols = [], []
     for m in meshes:
         uv = np.asarray(m['lightmap_uvs'], np.float32)
         uv = uv[(uv >= 0).all(1) & (uv <= 1).all(1)]
@@ -1258,11 +1259,21 @@ def bakedLightmap(level, log=print):
         H, W = px.shape[:2]
         c = px[np.clip((v * H).astype(np.int64), 0, H - 1), np.clip((u * W).astype(np.int64), 0, W - 1), :3] / 255.0
         if not linear: c = np.where(c <= 0.04045, c / 12.92, ((c + 0.055) / 1.055) ** 2.4)
-        lums.append(c @ np.array([0.2126, 0.7152, 0.0722]))
+        lums.append(c @ np.array([0.2126, 0.7152, 0.0722])); cols.append(c)
     mean = float(np.concatenate(lums).mean()) if lums else 0.0
     tag_brightness = info.get('brightness') or 0.0
     brightness = min(64.0, max(0.5, 1.0 / mean)) if mean > 1e-4 else 6.0
     log("Baked lighting %s: average lightmap value %.3f, tag brightness %.2f, using x%.2f" % (level['name'], mean, tag_brightness, brightness))
+    if scene is not None and cols:
+        # the level's own average light, for lighting forge objects to match: shadowed parts get roughly
+        # the darker half of it from the world, the sun adds the rest
+        c = np.concatenate(cols) * brightness
+        lum = c @ np.array([0.2126, 0.7152, 0.0722])
+        dark = c[lum <= np.median(lum)].mean(0)
+        dl = float(dark @ np.array([0.2126, 0.7152, 0.0722]))
+        if dl > 0.6: dark = dark * (0.6 / dl)       # keep shade from glowing
+        elif 0 < dl < 0.15: dark = dark * (0.15 / dl)
+        scene['mjolnir_ambient'] = tuple(float(v) for v in np.clip(dark, 0.02, 1.0))
     return img, brightness, convert
 
 def lightmappedMaterial(mat, img, brightness):
@@ -1421,7 +1432,7 @@ def ensureMapScene(context, log=print):
 
 # ---- sky and lighting ------------------------------------------------------------------------
 SKY_VERSION = 3  # 3: rebuilt with 3-channel self-illum. 2: sky uses self-illumination (Reach skies are mostly self-lit)
-LIGHTING_VERSION = 1
+LIGHTING_VERSION = 2  # 2: ambient from the baked lightmap / normalised sky colour
 SKY_DEFAULT_COLOR = (0.42, 0.55, 0.75)
 
 def skyMaterial(mat):
@@ -1568,7 +1579,7 @@ def lightingSun(scene):
         sun['mjolnir_sun'] = True
         sun.rotation_euler = (radians(40), 0.0, radians(35))
         scene.collection.objects.link(sun)
-    trySet(sun.data, energy=3.5, angle=radians(1.5), color=(1.0, 0.95, 0.88), use_shadow=True)
+    trySet(sun.data, energy=3.0, angle=radians(1.5), color=(1.0, 0.95, 0.88), use_shadow=True)
     trySet(sun.data, shadow_cascade_max_distance=600.0, shadow_cascade_count=4)
     return sun
 
@@ -1577,9 +1588,14 @@ def setupLighting(context, scene, mapScene=None, force=False):
     ambient occlusion, and the viewport switched to show it. Applied once per scene unless forced."""
     if not force and scene.get('mjolnir_lighting_version', 0) >= LIGHTING_VERSION: return False
     color = None
-    if mapScene is not None and mapScene.get('mjolnir_sky_color'): color = tuple(mapScene['mjolnir_sky_color'])
-    color = color or SKY_DEFAULT_COLOR
-    ambient = tuple(max(0.05, min(1.0, c)) * 0.8 for c in color)
+    if mapScene is not None and mapScene.get('mjolnir_ambient'):
+        ambient = tuple(mapScene['mjolnir_ambient'])   # matches the level's baked lighting
+    else:
+        if mapScene is not None and mapScene.get('mjolnir_sky_color'): color = tuple(mapScene['mjolnir_sky_color'])
+        color = color or SKY_DEFAULT_COLOR
+        # the sky's average is a hue, not a brightness: keep its tint at a usable ambient level
+        lum = max(1e-3, 0.2126 * color[0] + 0.7152 * color[1] + 0.0722 * color[2])
+        ambient = tuple(min(1.0, c / lum * 0.35) for c in color)
     world = lightingWorld(ambient)
     for sc in (scene, mapScene):
         if sc is None: continue
