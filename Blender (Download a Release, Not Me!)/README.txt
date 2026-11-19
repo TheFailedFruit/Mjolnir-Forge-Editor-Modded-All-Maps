@@ -51,6 +51,10 @@ If a model comes in facing the wrong way (can happen with ported/modded models),
 use right-click > Rotate Model 90 deg. It turns the shared model, so every copy turns; repeat as needed.
 
 Export uses the same palette, so objects are written back with the correct IDs for the modded map.
+Objects pasted in from another map are matched to this map by name, or for extracted models by the
+object's tag. Before writing to MCC, export leaves out (and lists in its message and the system
+console) any object the loaded map can't hold, since those can crash the game: a type that isn't in
+this map's palette, more copies of an item than the map allows, or a position far outside the map.
 
 If anything fails, it falls back to the original behaviour (built-in tables), and says why in the
 import message and the Forge Scene panel.

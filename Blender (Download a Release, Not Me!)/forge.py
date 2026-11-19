@@ -1826,6 +1826,7 @@ def ensureModelCollection(context, itemName, type_id, log=print):
         if placeholder: ob.display_type = 'WIRE'
     coll['mjolnir_type_id'] = type_id
     coll['mjolnir_tag'] = entry['tag_path'] or ""
+    coll['mjolnir_variant'] = entry.get('variant') or ""
     coll['mjolnir_map'] = os.path.basename(palette['path'] or "")
     coll['mjolnir_placeholder'] = placeholder
     coll['mjolnir_model_version'] = MODEL_VERSION
@@ -1967,6 +1968,15 @@ def exportForgeObjects(context, self=None):
     map_name = forge.GetMapName()
     loadMapPalette(context, map_name)
     
+    # objects that would put invalid data into MCC's memory are left out (and listed), instead of crashing the game
+    usePalette = palette['key'] is not None
+    bounds = None
+    if usePalette:
+        try: bounds = palette['cache'].world_bounds()
+        except Exception: bounds = None
+    if bounds is not None:   # generous margin: forge lets you build a little outside the level
+        bounds = [(a - max(50.0, 0.25 * (b - a)), b + max(50.0, 0.25 * (b - a))) for a, b in bounds]
+    counts, skipped = {}, []
     i = 0
     for inst in bpy.context.evaluated_depsgraph_get().object_instances:
         blobj = tryGetForgeObjectFromInstance(inst)
@@ -1974,6 +1984,23 @@ def exportForgeObjects(context, self=None):
             if i >= maxObjectCount: 
                 hitLimit = True
                 continue
+            try:
+                ty = blobj.forge.ExportTypeId(blobj, map_name)
+            except (KeyError, ValueError) as e:
+                skipped.append((blobj.name, "not in this map's palette (%s)" % e)); continue
+            if usePalette:
+                entry = palette['entries'].get(ty)
+                if entry is None:
+                    skipped.append((blobj.name, "type 0x%X doesn't exist on this map" % ty)); continue
+                cap = entry.get('max_allowed', 0) or 0
+                n = counts.get(ty >> 8, 0)
+                if 0 < cap <= n:
+                    skipped.append((blobj.name, "this map allows only %d of '%s'" % (cap, entry.get('name')))); continue
+                counts[ty >> 8] = n + 1
+            if bounds is not None:
+                pos = inst.matrix_world.col[3]
+                if not all(lo <= pos[k] <= hi for k, (lo, hi) in enumerate(bounds)):
+                    skipped.append((blobj.name, "outside the map (%.0f, %.0f, %.0f)" % (pos[0], pos[1], pos[2]))); continue
             fobj = forge.GetObjectPtr(i).contents
             blobj.forge.ToForgeObject(fobj, blobj, map_name, inst)
             forge.AddObject(i)
@@ -1981,6 +2008,12 @@ def exportForgeObjects(context, self=None):
     
     dllCall('WriteMemory')
     msg = "Exported %d objects in %.3fs"%(i,time.time() - t0)
+    if skipped:
+        print("Mjolnir: left out of the export (these would put invalid objects into MCC):")
+        for name, why in skipped: print("  %s: %s" % (name, why))
+        msg += ". Left out %d that this map can't hold: %s%s (full list in the system console)" % (
+            len(skipped), "; ".join("%s - %s" % s_ for s_ in skipped[:3]), "..." if len(skipped) > 3 else "")
+        hitLimit = True
     if self is None: print(msg)
     else: self.report({'WARNING' if hitLimit else 'INFO'}, msg)
     return True
@@ -2210,19 +2243,31 @@ class ForgeObjectProps(bpy.types.PropertyGroup):
         self.bottom = fobj.bottom
         self.UpdateScale(blobj)  # once every property (label, sequence, team) is set
     
+    def ExportTypeId(self, blobj, map_name):
+        """The object's forge type ID on the map being exported to (raises KeyError if it has none)."""
+        coll = blobj.instance_collection
+        if coll is None: return self.objectType
+        try: return GetObjectTypeId(map_name, coll.name_full)
+        except (KeyError, ValueError):
+            tid = coll.get('mjolnir_type_id')
+            if tid is None: raise
+            if palette['key'] is None: return tid
+            # an extracted model's ID belongs to the map it came from: find the same object (by tag) on this one
+            tag = coll.get('mjolnir_tag') or ""
+            same = [i for i, e in palette['entries'].items() if tag and e.get('tag_path') == tag]
+            if tid in same: return tid
+            var = coll.get('mjolnir_variant')
+            pick = [i for i in same if palette['entries'][i].get('variant') == var] or same
+            if pick: return min(pick)
+            raise KeyError("'%s' (%s) isn't in this map's palette" % (coll.name, tag or "unknown tag"))
+
     def ToForgeObject(self, fobj, blobj, map_name, inst=None):
         m = blobj.matrix_world if inst is None else inst.matrix_world
         fobj.forward = float3.fromVector(m.col[1].normalized())
         fobj.up = float3.fromVector(m.col[2].normalized())
         fobj.position = float3.fromVector(m.col[3])
 
-        coll = blobj.instance_collection
-        if coll is None: ty = self.objectType
-        else:
-            try: ty = GetObjectTypeId(map_name, coll.name_full)
-            except (KeyError, ValueError):
-                if coll.get('mjolnir_type_id') is not None: ty = coll['mjolnir_type_id']
-                else: raise
+        ty = self.ExportTypeId(blobj, map_name)
         fobj.itemCategory = ty >> 8
         fobj.itemVariant = ty & 0x00FF
 

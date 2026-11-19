@@ -370,6 +370,7 @@ class CacheFile:
                 eo = e_addr + e * ENTRY_SIZE
                 entry_name = self.string(self.i32(eo))
                 n_var, v_addr = self.block(eo + 4)
+                max_allowed, price = self.i32(eo + 0x10), self.i32(eo + 0x14)
                 for v in range(n_var):
                     vo = v_addr + v * VARIANT_SIZE
                     display = self.string(self.i32(vo))
@@ -383,6 +384,7 @@ class CacheFile:
                         tag_group=tag.group if tag else None,
                         tag_path=tag.path if tag else None,
                         tag_index=tag.index if tag else -1,
+                        entry_index=entry_index, max_allowed=max_allowed, price=price,
                     ))
                 entry_index += 1
         if result and not result[0]["category"].startswith("ff_"):
@@ -1244,7 +1246,21 @@ def _bsp_methods(cls):
                     clusters=[c for c in clusters if c in meshes],
                     instances=inst_out, shader_tags=shader_tags, report=report, lightmap=lightmap_info)
 
+    def world_bounds(self):
+        """Union of the level's BSP world bounds ((x0, x1), (y0, y1), (z0, z1)), or None."""
+        lo, hi = [1e30] * 3, [-1e30] * 3
+        for bsp, _ in self.structure_bsps():
+            try:
+                v = struct.unpack_from("<6f", self.read(bsp.meta + 0xF0, 24))
+            except MapReadError:
+                continue
+            if not all(abs(x) < 1e6 for x in v) or v[0] >= v[1] or v[2] >= v[3] or v[4] >= v[5]: continue
+            for i in range(3):
+                lo[i] = min(lo[i], v[2 * i]); hi[i] = max(hi[i], v[2 * i + 1])
+        return tuple(zip(lo, hi)) if lo[0] < hi[0] else None
+
     cls.bsp_layout = bsp_layout
+    cls.world_bounds = world_bounds
     cls.structure_bsps = structure_bsps
     cls.read_bsp = read_bsp
 _bsp_methods(CacheFile)
