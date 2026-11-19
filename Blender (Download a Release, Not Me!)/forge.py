@@ -755,7 +755,7 @@ def bitmapImage(bitmap_index, kind='color'):
     cache = palette['cache']
     tag = cache.tags.get(bitmap_index)
     if tag is None: raise ValueError("bitmap tag missing")
-    key = tag.path + ('|' + kind if kind != 'color' else '')
+    key = tag.path + ('|' + kind if kind != 'color' else '') + '|v2'   # v2: colour space from the bitmap's curve
     for img in bpy.data.images:
         if img.get('mjolnir_bitmap') == key: return img
     bm = cache.read_bitmap(bitmap_index)
@@ -764,9 +764,14 @@ def bitmapImage(bitmap_index, kind='color'):
         px = px.copy(); px[..., 1] = 255 - px[..., 1]
     h, w = px.shape[:2]
     img = bpy.data.images.new(tag.path.replace('\\', '/').split('/')[-1], w, h, alpha=True)
-    if kind != 'color':  # must be set before writing pixels: changing it regenerates the image
+    linear = kind != 'color' or bm.get('curve') == 3   # curve 3 = stored linear (not gamma encoded)
+    if linear:  # must be set before writing pixels: changing it regenerates the image
         try: img.colorspace_settings.name = 'Non-Color'
         except Exception: pass
+    c = px[::max(1, h // 64), ::max(1, w // 64), :3].astype(np.float32) / 255.0
+    if not linear: c = np.where(c <= 0.04045, c / 12.92, ((c + 0.055) / 1.055) ** 2.4)
+    img['mjolnir_mean'] = float((c @ np.array([0.2126, 0.7152, 0.0722], np.float32)).mean())
+    img['mjolnir_curve'] = int(bm.get('curve', 0))
     img.pixels.foreach_set((px[::-1].astype(np.float32) * (1.0 / 255.0)).ravel())
     try: img.pack()
     except Exception as e: print("Mjolnir: couldn't pack image %s: %s" % (img.name, e))
@@ -774,8 +779,17 @@ def bitmapImage(bitmap_index, kind='color'):
     return img
 
 BASE_USAGES = ('base_map', 'change_color_map', 'foam_texture', 'alpha_mask_map', 'detail_map')
-MATERIAL_VERSION = 4  # 4: 3-channel self-illum. 2: detail maps, terrain blending, specular/roughness. 3: values tuned on Boneyard, self-illum modes. Older materials are rebuilt.
+MATERIAL_VERSION = 5  # 5: detail scale measured per texture, curve-based colour space. 4: 4: 3-channel self-illum. 2: detail maps, terrain blending, specular/roughness. 3: values tuned on Boneyard, self-illum modes. Older materials are rebuilt.
 DETAIL_MULTIPLIER = 4.59479  # Halo's detail scale (2.0 in gamma space) applied to linear colours
+
+def detailScale(*image_nodes):
+    """Scale that makes a detail map average to 1 (Halo authors them so DETAIL_MULTIPLIER does this);
+    measured from the texture itself, so it's right whatever colour space it was stored in."""
+    f = []
+    for n in image_nodes:
+        m = n.image.get('mjolnir_mean') if n is not None and n.image is not None else None
+        f.append(min(8.0, max(1.0, 1.0 / m)) if m and m > 1e-4 else DETAIL_MULTIPLIER)
+    return sum(f) / len(f) if f else DETAIL_MULTIPLIER
 
 def bsdfInput(bsdf, *names):
     for n in names:
@@ -873,14 +887,14 @@ def texturedMaterial(mat, shader_index, log=print):
             f1 = math('MINIMUM', math('MULTIPLY', a, 2.0), 1.0)
             f2 = math('MAXIMUM', math('SUBTRACT', math('MULTIPLY', a, 2.0), 1.0), 0.0)
             det = mix(f2, mix(f1, d1.outputs['Color'], d2.outputs['Color']), d3.outputs['Color'])
-            color = vmath('SCALE', vmath('MULTIPLY', color, det), DETAIL_MULTIPLIER)
+            color = vmath('SCALE', vmath('MULTIPLY', color, det), detailScale(d1, d2, d3))
         elif d1 is not None and d2 is not None and ('blend' in albedo or 'overlay' in albedo):
             det = mix(a, d1.outputs['Color'], d2.outputs['Color'])
-            color = vmath('SCALE', vmath('MULTIPLY', color, det), DETAIL_MULTIPLIER)
-            if ov is not None: color = vmath('SCALE', vmath('MULTIPLY', color, ov.outputs['Color']), DETAIL_MULTIPLIER)
+            color = vmath('SCALE', vmath('MULTIPLY', color, det), detailScale(d1, d2))
+            if ov is not None: color = vmath('SCALE', vmath('MULTIPLY', color, ov.outputs['Color']), detailScale(ov))
         else:
             for d in (d1, d2, ov):
-                if d is not None: color = vmath('SCALE', vmath('MULTIPLY', color, d.outputs['Color']), DETAIL_MULTIPLIER)
+                if d is not None: color = vmath('SCALE', vmath('MULTIPLY', color, d.outputs['Color']), detailScale(d))
         return color
 
     tint = tints.get('albedo_color')
@@ -1000,7 +1014,7 @@ def texturedMaterial(mat, shader_index, log=print):
     elif si is not None:
         emit = si.outputs['Color']
         sd = image_node('self_illum_detail_map', 'color') if 'detail' in si_mode else None
-        if sd is not None: emit = vmath('SCALE', vmath('MULTIPLY', emit, sd.outputs['Color']), DETAIL_MULTIPLIER)
+        if sd is not None: emit = vmath('SCALE', vmath('MULTIPLY', emit, sd.outputs['Color']), detailScale(sd))
     elif si_mode == 'from_diffuse' and bsdf.inputs['Base Color'].links:
         emit = bsdf.inputs['Base Color'].links[0].from_socket
     if emit is not None:
@@ -1190,9 +1204,19 @@ def buildLevel(scene, title, log=print):
                                       (0, 0, 0, 1)))
             coll.objects.link(ob); count += 1
         log("Level %s: %d clusters, %d instances in %.1fs" % (level['name'], len(level['clusters']), len(level['instances']), time.time() - t0))
+    try:
+        curves, means = {}, []
+        for img in bpy.data.images:
+            if img.get('mjolnir_curve') is None: continue
+            curves[img['mjolnir_curve']] = curves.get(img['mjolnir_curve'], 0) + 1
+            if img.get('mjolnir_mean') is not None: means.append(img['mjolnir_mean'])
+        if means:
+            log("Textures: %d, by curve %s, average brightness %.3f" % (len(means), dict(sorted(curves.items())), sum(means) / len(means)))
+    except Exception:
+        pass
     return count
 
-LEVEL_VERSION = 5  # 5: lightmap orientation fixed. 2: large BSPs (>4096 buffers) + checked index decoding. 3: baked lightmaps. 4: lightmap exposure. Older builds are rebuilt.
+LEVEL_VERSION = 6  # 6: clusters decide lightmap orientation. 5: 5: lightmap orientation fixed. 2: large BSPs (>4096 buffers) + checked index decoding. 3: baked lightmaps. 4: lightmap exposure. Older builds are rebuilt.
 
 def bakedLightmap(level, log=print):
     """The level's baked lighting, if it can be used: (image, brightness, uv converter) or None.
@@ -1203,8 +1227,10 @@ def bakedLightmap(level, log=print):
     cache = palette['cache']
     try:
         px = cache.read_bitmap(info['bitmap'])['pixels']
+        # clusters (the big level surfaces) decide the orientation; instanced pieces are too small to tell
         meshes = [level['sections'][c] for c in level['clusters'] if level['sections'][c].get('lightmap_uvs') is not None]
-        meshes += [dict(lightmap_uvs=i[4], triangles=level['sections'][i[1]]['triangles'], positions=level['sections'][i[1]]['positions']) for i in level['instances'] if i[4] is not None]
+        if not meshes:
+            meshes = [dict(lightmap_uvs=i[4], triangles=level['sections'][i[1]]['triangles'], positions=level['sections'][i[1]]['positions']) for i in level['instances'] if i[4] is not None]
         if not meshes: return None
         o = mapreader.lightmap_orientation(px, meshes)
         log("Lightmap check %s: %s" % (level['name'], {k: o.get(k) for k in ('ok', 'blank', 'flip_u', 'v_from_top', 'triangles', 'all')}))
@@ -1212,6 +1238,7 @@ def bakedLightmap(level, log=print):
             log("Baked lighting for %s didn't line up with the geometry; using sun lighting instead" % level['name'])
             return None
         img = bitmapImage(info['bitmap'], 'color')
+        linear = img.colorspace_settings.name == 'Non-Color'
     except Exception as e:
         log("Baked lighting for %s skipped: %s" % (level['name'], e)); return None
     fu, vt = o['flip_u'], o['v_from_top']
@@ -1230,7 +1257,7 @@ def bakedLightmap(level, log=print):
         v = uv[:, 1] if vt else 1.0 - uv[:, 1]
         H, W = px.shape[:2]
         c = px[np.clip((v * H).astype(np.int64), 0, H - 1), np.clip((u * W).astype(np.int64), 0, W - 1), :3] / 255.0
-        c = np.where(c <= 0.04045, c / 12.92, ((c + 0.055) / 1.055) ** 2.4)
+        if not linear: c = np.where(c <= 0.04045, c / 12.92, ((c + 0.055) / 1.055) ** 2.4)
         lums.append(c @ np.array([0.2126, 0.7152, 0.0722]))
     mean = float(np.concatenate(lums).mean()) if lums else 0.0
     tag_brightness = info.get('brightness') or 0.0
