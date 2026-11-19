@@ -1708,6 +1708,85 @@ def locate_loaded_map(map_display_name=None, override=None, extra_dirs=(), log=_
 # Command line test
 # ---------------------------------------------------------------------------------------------
 
+def dump_lightmap(c, path):
+    """Everything needed to work out how the baked lightmap maps onto the level, in one compressed file."""
+    if np is None: print("numpy is needed: pip install numpy"); return
+    out = {}
+    for b, (bsp, lm) in enumerate(c.structure_bsps()):
+        if lm is None: continue
+        try:
+            level = c.read_bsp(bsp, lm)
+        except Exception as ex:
+            print(f"dump: {bsp.path}: {ex}"); continue
+        info = level.get("lightmap")
+        if not info: continue
+        lmm = lm.meta
+        t = c.tags[info["bitmap"]]
+        out[f"b{b}_brightness"] = np.float32(info["brightness"])
+        bm = c.read_bitmap(info["bitmap"])
+        for k in range(3):
+            try: out[f"b{b}_intensity{k}"] = c.read_bitmap(info["bitmap"], 0, layer_offset=k * bm["level_size"])["pixels"]
+            except Exception as ex: print(f"dump: layer {k}: {ex}")
+        try:
+            pt = c.tag_ref(lmm + LBSP_PRIMARY_MAP)
+            if pt is not None and pt.group == "bitm": out[f"b{b}_primary"] = c.read_bitmap(pt.index)["pixels"]
+        except Exception as ex:
+            print(f"dump: primary: {ex}")
+        # raw section data straight from the resource, unaltered (no compaction), for every cluster
+        res = c.i32(lmm + LBSP_RESOURCE) & 0xFFFF
+        data, entry = c.read_resource(res)
+        vb_info, ib_info = RenderModelReader(c, bsp)._buffer_info(entry)
+        fix = entry["fixups"]
+        rt = c._resource_tables()
+        vhead = rt["fixup_addr"] + entry["fixup_offset"]
+        out[f"b{b}_vb_headers"] = np.frombuffer(c.read(vhead, 28 * len(vb_info)), np.uint8).reshape(-1, 28)
+        n_sec, s_addr = c.block(lmm + LBSP_SECTIONS)
+        out[f"b{b}_sections_raw"] = np.frombuffer(c.read(s_addr, SECTION_SIZE * n_sec), np.uint8).reshape(-1, SECTION_SIZE)
+        n_a, a_addr = c.block(lmm + 0x48)
+        out[f"b{b}_block48"] = np.frombuffer(c.read(a_addr, 4 * n_a), "<i2").reshape(-1, 2)
+        n_i, i_addr = c.block(lmm + 0xF4)
+        out[f"b{b}_per_instance"] = np.frombuffer(c.read(i_addr, 2 * n_i), "<i2")
+        L = c.bsp_layout()
+        n_cl, cl_addr = c.block(bsp.meta + L["clusters"])
+        clusters = [c.i16(cl_addr + CLUSTER_SIZE * i + CLUSTER_SECTION) for i in range(n_cl)]
+        out[f"b{b}_clusters"] = np.array(clusters, np.int32)
+        try:
+            n_bb, bb_addr = c.block(bsp.meta + L["bboxes"])
+            out[f"b{b}_bboxes"] = np.frombuffer(c.read(bb_addr, 52 * n_bb), np.uint8).reshape(-1, 52)
+        except MapReadError: pass
+        wanted = set(clusters)
+        lit_inst = [i for i, v in enumerate(out[f"b{b}_per_instance"]) if v >= 0][:150]
+        try:
+            entry_i = c.resource_entry(c.i32(bsp.meta + L["instances_res"]) & 0xFFFF)
+            ibase = rt["fixup_addr"] + entry_i["fixup_offset"] + entry_i["fixups"][-10]
+            recs = [c.read(ibase + 156 * i, 156) for i in lit_inst]
+            out[f"b{b}_instances"] = np.array(lit_inst, np.int32)
+            out[f"b{b}_instance_records"] = np.frombuffer(b"".join(recs), np.uint8).reshape(-1, 156) if recs else np.zeros((0, 156), np.uint8)
+            wanted |= {struct.unpack_from("<h", r, 58)[0] for r in recs}
+        except Exception as ex:
+            print(f"dump: instances: {ex}")
+        bufs = set()
+        for si in wanted:
+            if not (0 <= si < n_sec): continue
+            o = s_addr + SECTION_SIZE * si
+            bufs |= {c.i16(o + 24 + 2 * k) for k in range(8)} | {c.i16(o + 40) + 100000}
+        bufs |= {int(v) for v in out[f"b{b}_per_instance"] if v >= 0}
+        for si in wanted:
+            if 0 <= si < len(out[f"b{b}_block48"]): bufs.add(int(out[f"b{b}_block48"][si][0]))
+        total = 0
+        for vb in sorted(bufs):
+            if vb >= 100000:
+                i = vb - 100000
+                if 0 <= i < len(ib_info):
+                    off = fix[len(vb_info) * 2 + i]; out[f"b{b}_ib{i}"] = np.frombuffer(data[off:off + ib_info[i][1]], np.uint8); total += ib_info[i][1]
+            elif 0 <= vb < len(vb_info):
+                off = fix[vb]; out[f"b{b}_vb{vb}"] = np.frombuffer(data[off:off + vb_info[vb][1]], np.uint8); total += vb_info[vb][1]
+        out[f"b{b}_ib_info"] = np.array(ib_info, np.int64); out[f"b{b}_vb_info"] = np.array(vb_info, np.int64)
+        print(f"dump: {bsp.path}: {len(wanted)} sections, {len(bufs)} buffers ({total // 1024} KB)")
+    out["map"] = np.array(c.scenario_name)
+    np.savez_compressed(path, **out)
+    print(f"dump saved to {path} ({os.path.getsize(path) // 1024} KB)")
+
 def probe_lighting(c, out_dir):
     """Diagnostics for sky / shading / lightmap support (output is meant to be shared for debugging)."""
     os.makedirs(out_dir, exist_ok=True)
@@ -1722,6 +1801,7 @@ def probe_lighting(c, out_dir):
             for spath, sidx in model["shader_tags"].items():
                 info = c.read_shader(sidx) or {}
                 print(f"    shader {spath} [{info.get('group')}]: {', '.join(info.get('textures', {}))} {info.get('options')}")
+                print(f"      params {dict((k, tuple(round(x, 3) for x in v)) for k, v in info.get('params', {}).items())}")
         except Exception as ex:
             print(f"  sky {t.path}: failed - {ex}")
     for bsp, lm in c.structure_bsps():
@@ -1924,6 +2004,7 @@ def main(argv):
     ap.add_argument("--bsp", metavar="DIR", help="export the level geometry (clusters + instances) as .obj into DIR")
     ap.add_argument("--textures", metavar="DIR", help="with --obj: also save each model's textures as .png into DIR")
     ap.add_argument("--shared", metavar="DIR", help="folder containing shared.map (default: next to the map)")
+    ap.add_argument("--lightmap-dump", metavar="FILE", help="save the level's lightmap images, cluster geometry and lightmap coordinates to FILE (.npz) for analysis")
     ap.add_argument("--lighting", metavar="DIR", help="probe the map's sky, level shaders and baked lightmaps; writes what it can decode into DIR")
     a = ap.parse_args(argv)
 
@@ -1977,6 +2058,8 @@ def main(argv):
 
         if a.lighting:
             probe_lighting(c, a.lighting)
+        if a.lightmap_dump:
+            dump_lightmap(c, a.lightmap_dump)
 
         if a.obj:
             os.makedirs(a.obj, exist_ok=True)

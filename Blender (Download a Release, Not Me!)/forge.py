@@ -774,7 +774,7 @@ def bitmapImage(bitmap_index, kind='color'):
     return img
 
 BASE_USAGES = ('base_map', 'change_color_map', 'foam_texture', 'alpha_mask_map', 'detail_map')
-MATERIAL_VERSION = 3  # 2: detail maps, terrain blending, specular/roughness. 3: values tuned on Boneyard, self-illum modes. Older materials are rebuilt.
+MATERIAL_VERSION = 4  # 4: 3-channel self-illum. 2: detail maps, terrain blending, specular/roughness. 3: values tuned on Boneyard, self-illum modes. Older materials are rebuilt.
 DETAIL_MULTIPLIER = 4.59479  # Halo's detail scale (2.0 in gamma space) applied to linear colours
 
 def bsdfInput(bsdf, *names):
@@ -983,7 +983,21 @@ def texturedMaterial(mat, shader_index, log=print):
     si_mode = opts.get('self_illumination', 'off')
     si = image_node('self_illum_map', 'color') if si_mode not in ('off', 'plasma') else None
     emit = None
-    if si is not None:
+    if si is not None and si_mode == '3_channel_self_illum':
+        # R, G, B of the map are masks for three colours (channel_a/b/c, alpha = intensity)
+        sep = nodes.new('ShaderNodeSeparateColor') if hasattr(bpy.types, 'ShaderNodeSeparateColor') else nodes.new('ShaderNodeSeparateRGB')
+        sep.location = (-450, state['y']); links.new(si.outputs['Color'], sep.inputs[0])
+        emit = None
+        for k, ch in enumerate(('channel_a', 'channel_b', 'channel_c')):
+            col = params.get(ch)
+            if col is None: continue
+            w = (col[0] * col[3], col[1] * col[3], col[2] * col[3]) if len(col) > 3 and col[3] > 0 else tuple(col[:3])
+            n = nodes.new('ShaderNodeVectorMath'); n.operation = 'SCALE'; n.location = (-250, state['y'] - 60 * k)
+            n.inputs[0].default_value = w; links.new(sep.outputs[k], n.inputs['Scale'])
+            emit = n.outputs['Vector'] if emit is None else vmath('ADD', emit, n.outputs['Vector'])
+        if emit is None:  # no channel colours: show the mask's brightness
+            bw = nodes.new('ShaderNodeRGBToBW'); links.new(si.outputs['Color'], bw.inputs[0]); emit = bw.outputs[0]
+    elif si is not None:
         emit = si.outputs['Color']
         sd = image_node('self_illum_detail_map', 'color') if 'detail' in si_mode else None
         if sd is not None: emit = vmath('SCALE', vmath('MULTIPLY', emit, sd.outputs['Color']), DETAIL_MULTIPLIER)
@@ -1343,6 +1357,7 @@ def ensureMapScene(context, log=print):
         built = buildLevel(sc, mapTitle(key), log)
         sc['mjolnir_level_version'] = LEVEL_VERSION
         sc['mjolnir_baked'] = bool(context.scene.forge.bakedLighting)
+        sc['mjolnir_sky_version'] = 0   # the sky lived in the removed level collection
         return sc, built
     cur = context.scene
     if key == 'forge_halo':  # forge.blend's own Forge World scene (hand-made level): adopt it
@@ -1364,7 +1379,7 @@ def ensureMapScene(context, log=print):
     return sc, built
 
 # ---- sky and lighting ------------------------------------------------------------------------
-SKY_VERSION = 2  # 2: sky uses self-illumination (Reach skies are mostly self-lit)
+SKY_VERSION = 3  # 3: rebuilt with 3-channel self-illum. 2: sky uses self-illumination (Reach skies are mostly self-lit)
 LIGHTING_VERSION = 1
 SKY_DEFAULT_COLOR = (0.42, 0.55, 0.75)
 
@@ -1374,7 +1389,7 @@ def skyMaterial(mat):
     key = 'sky|' + mat.name
     for m in list(bpy.data.materials):
         if m.get('mjolnir_sky_of') == key:
-            if m.get('mjolnir_sky_version') == SKY_VERSION: return m
+            if m.get('mjolnir_sky_version') == SKY_VERSION and m.get('mjolnir_textured') == mat.get('mjolnir_textured'): return m
             m.name = m.name + " old"   # left for Blender to purge once unused
             del m['mjolnir_sky_of']
     sky = mat.copy(); sky.name = mat.name + " (sky)"
@@ -2595,6 +2610,8 @@ class SetupGameLighting(Operator):
         if key and palette.get('cache') is not None and context.scene.forge.importLevel:
             try:  # rebuilds the level if Baked Lighting was switched since it was built
                 sc, built = ensureMapScene(context)
+                if sc is not None:
+                    showMap(context.scene if not isMapScene(context.scene) else workScene(context), sc)
                 if built: extra = ", rebuilt %s level" % sc.name
             except Exception as e:
                 extra = " (level rebuild failed: %s)" % e
@@ -2634,7 +2651,7 @@ class ForgeSceneProps(bpy.types.PropertyGroup):
             if n is not None: n.inputs['Scale'].default_value = m.get('mjolnir_lightmap_brightness', 1.0) * self.bakedBrightness
     bakedBrightness: FloatProperty(name="Baked Brightness", default=1.0, min=0.0, soft_max=4.0,
         description="Brightness of the baked lighting (1 = automatic exposure)", update=UpdateBakedBrightness)
-    bakedLighting: BoolProperty(name="Baked Lighting", default=True,
+    bakedLighting: BoolProperty(name="Baked Lighting", default=False,
         description="Light the map's level geometry with its baked lightmaps from the .map, like the game (experimental). Off = sun lighting")
     gameLighting: BoolProperty(name="Game Lighting", default=True,
         description="On import, add the map's sky and set up EEVEE lighting (sun, sky-coloured ambient light, shadows, AO) so it looks closer to the game")
