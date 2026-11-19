@@ -27,7 +27,7 @@ try:
 except ImportError:  # Blender always has numpy; plain Python may not
     np = None
 
-VERSION = "1.2.1"
+VERSION = "1.2.2"
 
 class MapReadError(Exception):
     pass
@@ -757,7 +757,7 @@ def decode_triangles(raw, vcount, submeshes, layout, info=None):
 
 def build_mesh(pos, nrm, uv, tris, tri_shader, shaders):
     """Compact a mesh down to the vertices its triangles use."""
-    remap, out_pos, out_nrm, out_uv, out_tris = {}, [], [], [], []
+    remap, out_pos, out_nrm, out_uv, out_tris, source = {}, [], [], [], [], []
     for t in tris:
         nt = []
         for v in t:
@@ -765,7 +765,7 @@ def build_mesh(pos, nrm, uv, tris, tri_shader, shaders):
             j = remap.get(v)
             if j is None:
                 j = remap[v] = len(out_pos)
-                out_pos.append(pos[v])
+                out_pos.append(pos[v]); source.append(v)
                 if nrm is not None: out_nrm.append(nrm[v])
                 if uv is not None: out_uv.append(uv[v])
             nt.append(j)
@@ -782,7 +782,7 @@ def build_mesh(pos, nrm, uv, tris, tri_shader, shaders):
         tri_mat.append(mat_lookup[name])
     return dict(positions=out_pos, normals=out_nrm if nrm is not None else None,
                 uvs=out_uv if uv is not None else None, triangles=out_tris,
-                materials=mats, tri_materials=tri_mat)
+                materials=mats, tri_materials=tri_mat, source=source)
 
 def transform_mesh(mesh, scale, m):
     # 4x3 row-vector matrix: rows 0-2 rotation, row 3 translation
@@ -795,6 +795,45 @@ def transform_mesh(mesh, scale, m):
     if mesh["normals"]:
         mesh["normals"] = [tf((n[0] / scale, n[1] / scale, n[2] / scale) if scale else n, False) for n in mesh["normals"]]
     return mesh
+
+def lightmap_orientation(pixels, meshes):
+    """Work out how lightmap UVs map onto the lightmap image: the right way makes neighbouring vertices
+    sample similar light. pixels: RGBA uint8, rows top to bottom. meshes: dicts with 'lightmap_uvs' (N x 2,
+    -1 = none) and 'triangles'. Returns dict(flip_u, v_from_top, score, baseline, ok)."""
+    H, W = pixels.shape[:2]
+    img = pixels[..., :3].astype(np.float32) / 255.0
+    edges = []
+    for m in meshes:
+        uv = m.get("lightmap_uvs")
+        if uv is None or not m["triangles"]: continue
+        t = np.asarray(m["triangles"], np.int64)
+        e = np.concatenate([t[:, [0, 1]], t[:, [1, 2]], t[:, [2, 0]]])
+        good = (uv[e[:, 0], 0] >= 0) & (uv[e[:, 1], 0] >= 0)
+        a, b = uv[e[good, 0]], uv[e[good, 1]]
+        # short edges only: long ones may cross chart borders
+        short = np.abs(a - b).max(1) < 8.0 / W
+        edges.append((a[short], b[short]))
+    if not edges: return dict(ok=False, score=None, baseline=None, flip_u=False, v_from_top=True)
+    A = np.concatenate([e[0] for e in edges]); B = np.concatenate([e[1] for e in edges])
+    if len(A) > 400000:
+        sel = np.random.default_rng(1).choice(len(A), 400000, replace=False); A, B = A[sel], B[sel]
+    def sample(uv, flip_u, v_from_top):
+        u = 1.0 - uv[:, 0] if flip_u else uv[:, 0]
+        v = uv[:, 1] if v_from_top else 1.0 - uv[:, 1]
+        x = np.clip((u * W).astype(np.int64), 0, W - 1); y = np.clip((v * H).astype(np.int64), 0, H - 1)
+        return img[y, x]
+    def score(fu, vt):
+        sa = sample(A, fu, vt)
+        diff = float(np.abs(sa - sample(B, fu, vt)).sum(1).mean())
+        return diff + float((sa.sum(1) < 0.02).mean())   # landing on unused (black) atlas space counts against
+    results = sorted((score(fu, vt), fu, vt) for fu in (False, True) for vt in (True, False))
+    rng = np.random.default_rng(2)
+    perm = B[rng.permutation(len(B))]
+    baseline = float(np.abs(sample(A, False, True) - sample(perm, False, True)).sum(1).mean())
+    best, fu, vt = results[0]
+    blank = float((sample(A, fu, vt).sum(1) < 0.02).mean())
+    return dict(ok=bool(best < 0.5 * baseline and blank < 0.3), score=best, baseline=baseline, flip_u=fu, v_from_top=vt,
+                blank=blank, all=[(round(r[0], 4), r[1], r[2]) for r in results], edges=len(A))
 
 def write_png(pixels, path):
     """Write an RGBA uint8 (H,W,4) array as PNG with the standard library only."""
@@ -1084,7 +1123,7 @@ def _bsp_methods(cls):
                     scale = self.f32(o)
                     mat = struct.unpack_from("<12f", self.read(o + 4, 48))
                     section = self.i16(o + 58)
-                    instances.append((names[i], section, scale, mat))
+                    instances.append((names[i], section, scale, mat, i))
             except MapReadError as e:
                 if log: log(f"{bsp.path}: instanced geometry skipped ({e})")
 
@@ -1096,13 +1135,35 @@ def _bsp_methods(cls):
             o = s_addr + SECTION_SIZE * i
             nsub, sub_addr = self.block(o)
             submeshes = [struct.unpack_from("<hxxii", self.read(sub_addr + 24 * k, 12)) for k in range(nsub)]
-            sections.append(dict(submeshes=submeshes, vb=self.i16(o + 24), ib=self.i16(o + 40),
+            sections.append(dict(submeshes=submeshes, vb=self.i16(o + 24), vb2=self.i16(o + 26), ib=self.i16(o + 40),
                                  flags=self.u16(o + 44), vformat=self.u8(o + 47), iformat=self.u8(o + 50)))
         res = self.i32(lm + LBSP_RESOURCE) & 0xFFFF
         if res == 0xFFFF: raise MapReadError(f"{bsp.path}: has no geometry resource (unused BSP)")
         data, entry = self.read_resource(res)
         vb_info, ib_info = RenderModelReader(self, bsp)._buffer_info(entry)
         fix = entry["fixups"]
+        rt = self._resource_tables()
+        vb_head = rt["fixup_addr"] + entry["fixup_offset"]
+
+        def lightmap_uvs(vbi):
+            """Lightmap texture coordinates: a buffer of 2 x unorm16 per vertex (declaration type 4)."""
+            if np is None or not (0 <= vbi < len(vb_info)): return None
+            if self.u16(vb_head + 28 * vbi + 4) != 4 or self.u16(vb_head + 28 * vbi + 6) != 4: return None
+            cnt, ln = vb_info[vbi]
+            raw = data[fix[vbi]:fix[vbi] + cnt * 4]
+            if len(raw) < cnt * 4: return None
+            return np.frombuffer(raw, "<u2").reshape(cnt, 2).astype(np.float32) / 65535.0
+        try:
+            n_pi, pi_addr = self.block(lightmap.meta + LBSP_INSTANCE_UVS)
+            per_instance = [self.i16(pi_addr + 2 * i) for i in range(n_pi)]
+        except MapReadError:
+            per_instance = []
+        lm_bitmap = None
+        try:
+            t = self.tag_ref(lightmap.meta + LBSP_INTENSITY_MAP)
+            if t is not None and t.group == "bitm": lm_bitmap = t.index
+        except MapReadError:
+            pass
 
         wanted = set(c for c in clusters if c >= 0) | set(i[1] for i in instances if i[1] >= 0)
         meshes = {}
@@ -1150,14 +1211,36 @@ def _bsp_methods(cls):
                 if info.get("dropped"): report["dropped"] += info["dropped"]
                 if info.get("width") and info["width"] != (4 if vcount > 0xFFFF else 2): report["width_fixed"] += 1
                 mesh = build_mesh(pos, nrm, uv, tris, tri_shader, shaders)
+                if si in cluster_set and lm_bitmap is not None:
+                    luv = lightmap_uvs(sec["vb2"])
+                    if luv is not None:
+                        src = np.asarray(mesh["source"], np.int64)
+                        ok = src < len(luv)
+                        out = np.full((len(src), 2), -1.0, np.float32)
+                        out[ok] = luv[src[ok]]
+                        mesh["lightmap_uvs"] = out
+                        report.setdefault("lightmap_clusters", []).append((si, len(luv), vcount))
                 if mesh["triangles"]: meshes[si] = mesh
                 else: report["empty"].append((si, vcount, info.get("indices"), info.get("layout"), sec["iformat"]))
             except (MapReadError, IndexError, struct.error, ValueError) as e:
                 skip(si, f"{type(e).__name__}: {e}")
                 if log: log(f"{bsp.path}: section {si} skipped ({e})")
+        inst_out = []
+        for name, si, scale, mat, ii in instances:
+            if si not in meshes: continue
+            luv = None
+            if lm_bitmap is not None and ii < len(per_instance) and per_instance[ii] >= 0:
+                arr = lightmap_uvs(per_instance[ii])
+                src = np.asarray(meshes[si]["source"], np.int64) if arr is not None else None
+                if arr is not None and len(src) and src.max() < len(arr): luv = arr[src]
+            inst_out.append((name, si, scale, mat, luv))
+        report["lightmapped_instances"] = sum(1 for i in inst_out if i[4] is not None)
+        lightmap_info = None
+        if lm_bitmap is not None:
+            lightmap_info = dict(bitmap=lm_bitmap, brightness=self.f32(lightmap.meta + 0x18))
         return dict(name=bsp.path.replace("\\", "/").split("/")[-1], path=bsp.path, sections=meshes,
                     clusters=[c for c in clusters if c in meshes],
-                    instances=[i for i in instances if i[1] in meshes], shader_tags=shader_tags, report=report)
+                    instances=inst_out, shader_tags=shader_tags, report=report, lightmap=lightmap_info)
 
     cls.bsp_layout = bsp_layout
     cls.structure_bsps = structure_bsps
@@ -1176,7 +1259,7 @@ RMDF_CATEGORIES = 16
 BITM_BITMAPS, BITM_RESOURCES, BITM_INTERLEAVED = 124, 168, 180
 BITM_DATA_SIZE = 56
 SCNR_SKIES = 0x88
-LBSP_PRIMARY_MAP, LBSP_INTENSITY_MAP = 0x1C, 0x2C
+LBSP_PRIMARY_MAP, LBSP_INTENSITY_MAP, LBSP_INSTANCE_UVS = 0x1C, 0x2C, 0xF4
 
 BITMAP_FORMATS = {0: "A8", 1: "Y8", 2: "AY8", 3: "A8Y8", 6: "R5G6B5", 8: "A1R5G5B5", 9: "A4R4G4B4",
                   10: "X8R8G8B8", 11: "A8R8G8B8", 14: "DXT1", 15: "DXT3", 16: "DXT5", 22: "U8V8",
@@ -1694,45 +1777,144 @@ def probe_lighting(c, out_dir):
                             print(f"      layer {k}{tag_}: {ex}")
             except Exception as ex:
                 print(f"    {label} map failed: {ex}")
-        # which vertex buffers hold the lightmap texture coordinates
+        if np is not None:
+            try:
+                level = c.read_bsp(bsp, lm)
+                info = level.get("lightmap")
+                if info:
+                    px = c.read_bitmap(info["bitmap"])["pixels"]
+                    lit = [level["sections"][si] for si in level["clusters"] if "lightmap_uvs" in level["sections"][si]]
+                    lit += [dict(lightmap_uvs=i[4], triangles=level["sections"][i[1]]["triangles"]) for i in level["instances"] if i[4] is not None]
+                    o = lightmap_orientation(px, lit)
+                    print(f"    lightmap check: {len(lit)} lightmapped meshes ({level['report'].get('lightmapped_instances')} instances), "
+                          f"clusters (section, uv count, vertex count) {level['report'].get('lightmap_clusters', [])[:6]}")
+                    print(f"    lightmap orientation: {o}")
+            except Exception as ex:
+                print(f"    lightmap check failed: {type(ex).__name__}: {ex}")
         try:
-            lmm = lm.meta
-            n_a, a_addr = c.block(lmm + 0x48)
-            cl_vb = [c.i16(a_addr + 4 * i) for i in range(n_a)]
-            n_i, i_addr = c.block(lmm + 0xF4)
-            in_vb = [c.i16(i_addr + 2 * i) for i in range(n_i)]
-            n_cl, cl_addr = c.block(bsp.meta + c.bsp_layout()["clusters"])
-            n_in, _ = c.block(bsp.meta + c.bsp_layout()["instances"])
-            print(f"    lightmap uv buffers: {n_a} per-cluster (bsp has {n_cl} clusters) {cl_vb[:12]}, {n_i} per-instance (bsp has {n_in} instances) {in_vb[:12]}")
-            res = c.i32(lmm + LBSP_RESOURCE) & 0xFFFF
-            if res != 0xFFFF:
-                data, entry = c.read_resource(res)
-                vb_info, ib_info = RenderModelReader(c, bsp)._buffer_info(entry)
-                fix = entry["fixups"]
-                print(f"    geometry resource: {len(vb_info)} vertex buffers, {len(ib_info)} index buffers")
-                n_sec, s_addr = c.block(lmm + LBSP_SECTIONS)
-                def show(kind, i, si, vbi):
-                    if si is None or not (0 <= si < n_sec) or not (0 <= vbi < len(vb_info)): 
-                        print(f"      {kind} {i}: section {si}, uv buffer {vbi} (out of range)"); return
-                    o = s_addr + SECTION_SIZE * si
-                    vbs = [c.i16(o + 24 + 2 * k) for k in range(8)]
-                    sc_, sl = vb_info[vbs[0]] if 0 <= vbs[0] < len(vb_info) else (0, 0)
-                    cnt, ln = vb_info[vbi]
-                    raw = data[fix[vbi]:fix[vbi] + min(ln, 32)]
-                    print(f"      {kind} {i}: section {si} buffers {vbs} ({sc_} verts, {sl // max(sc_, 1)} bytes each) -> uv buffer {vbi}: {cnt} verts, "
-                          f"{ln // max(cnt, 1)} bytes each, first bytes {raw.hex()}")
-                for i in range(min(4, n_cl, len(cl_vb))):
-                    show("cluster", i, c.i16(cl_addr + CLUSTER_SIZE * i + CLUSTER_SECTION), cl_vb[i])
-                n_in, in_addr = c.block(bsp.meta + c.bsp_layout()["instances"])
-                try:
-                    entry_i = c.resource_entry(c.i32(bsp.meta + c.bsp_layout()["instances_res"]) & 0xFFFF)
-                    base = c._resource_tables()["fixup_addr"] + entry_i["fixup_offset"] + entry_i["fixups"][-10]
-                    for i in range(min(4, n_in, len(in_vb))):
-                        show("instance", i, c.i16(base + 156 * i + 58), in_vb[i])
-                except Exception as ex:
-                    print(f"      instances: {ex}")
+            probe_lightmap_uvs(c, bsp, lm, out_dir)
         except Exception as ex:
+            import traceback; traceback.print_exc()
             print(f"    lightmap uv probe failed: {type(ex).__name__}: {ex}")
+
+def _uv_candidates(raw, count, stride):
+    """Possible decodings of a 2D texture coordinate stream (name -> N x 2 array)."""
+    out = {}
+    if np is None or count <= 0 or stride <= 0 or len(raw) < count * stride: return out
+    buf = np.frombuffer(raw[:count * stride], np.uint8).reshape(count, stride)
+    def view(dt, n):
+        return np.ascontiguousarray(buf[:, :np.dtype(dt).itemsize * n]).view(dt).reshape(count, n).astype(np.float64)
+    if stride >= 4:
+        out["half2"] = view("<f2", 2)
+        out["unorm16"] = view("<u2", 2) / 65535.0
+        out["snorm16"] = (view("<i2", 2) / 32767.0 + 1.0) / 2.0
+    if stride >= 8:
+        out["float2"] = view("<f4", 2)
+    return out
+
+def probe_lightmap_uvs(c, bsp, lm, out_dir):
+    lmm = lm.meta
+    n_a, a_addr = c.block(lmm + 0x48)
+    per_section = [c.i16(a_addr + 4 * i) for i in range(n_a)]
+    n_i, i_addr = c.block(lmm + 0xF4)
+    per_instance = [c.i16(i_addr + 2 * i) for i in range(n_i)]
+    L = c.bsp_layout()
+    n_cl, cl_addr = c.block(bsp.meta + L["clusters"])
+    clusters = [c.i16(cl_addr + CLUSTER_SIZE * i + CLUSTER_SECTION) for i in range(n_cl)]
+    n_sec, s_addr = c.block(lmm + LBSP_SECTIONS)
+    print(f"    lightmap uv: block 0x48 has {n_a} entries ({sum(v >= 0 for v in per_section)} set; lightmap sections: {n_sec}), "
+          f"per-instance {n_i} entries ({sum(v >= 0 for v in per_instance)} set)")
+    res = c.i32(lmm + LBSP_RESOURCE) & 0xFFFF
+    if res == 0xFFFF: return
+    data, entry = c.read_resource(res)
+    rt = c._resource_tables()
+    vbase = rt["fixup_addr"] + entry["fixup_offset"]
+    vb_info, ib_info = RenderModelReader(c, bsp)._buffer_info(entry)
+    vb_decl = [c.read(vbase + 28 * i, 28).hex() for i in range(min(len(vb_info), 6000))]
+    fix = entry["fixups"]
+    print(f"    geometry resource: {len(vb_info)} vertex buffers, {len(ib_info)} index buffers")
+
+    try:
+        n_bb, bb_addr = c.block(bsp.meta + L["bboxes"])
+    except MapReadError:
+        n_bb = 0
+    def section_geometry(si):
+        o = s_addr + SECTION_SIZE * si
+        nsub, sub_addr = c.block(o)
+        submeshes = [struct.unpack_from("<hxxii", c.read(sub_addr + 24 * k, 12)) for k in range(nsub)]
+        vbs = [c.i16(o + 24 + 2 * k) for k in range(8)]
+        ib, flags, vformat, iformat = c.i16(o + 40), c.u16(o + 44), c.u8(o + 47), c.u8(o + 50)
+        vcount, vlen = vb_info[vbs[0]]
+        if si < n_bb:
+            v = struct.unpack_from("<10f", c.read(bb_addr + 52 * si + 4, 40))
+            b = ((v[0], v[1]), (v[2], v[3]), (v[4], v[5]), (v[6], v[7]), (v[8], v[9]))
+            if not any(b[0]): b = ((0.0, 1.0),) * 5
+        else:
+            b = ((0.0, 1.0),) * 5
+        pos, nrm, uv = decode_vertices(data[fix[vbs[0]]:fix[vbs[0]] + vlen], vcount, vformat, *b)
+        ifmt, ilen = ib_info[ib]
+        off = fix[len(vb_info) * 2 + ib]
+        tris, _ = decode_triangles(data[off:off + ilen], vcount, submeshes, ifmt, {})
+        return vbs, vcount, pos, tris
+
+    def show_buffer(label, vbi, vcount):
+        if not (0 <= vbi < len(vb_info)): return None
+        cnt, ln = vb_info[vbi]
+        stride = ln // max(cnt, 1)
+        raw = data[fix[vbi]:fix[vbi] + ln]
+        print(f"        {label} buffer {vbi}: {cnt} verts x {stride} bytes, header {vb_decl[vbi] if vbi < len(vb_decl) else '?'}, first bytes {raw[:24].hex()}")
+        cands = _uv_candidates(raw, cnt, stride)
+        for name, uv in cands.items():
+            ok = np.isfinite(uv).all(1) & (uv >= -0.01).all(1) & (uv <= 1.01).all(1)
+            print(f"          as {name:8s}: {ok.mean() * 100:5.1f}% in 0..1, u {np.nanmin(uv[:, 0]):.3f}..{np.nanmax(uv[:, 0]):.3f}, v {np.nanmin(uv[:, 1]):.3f}..{np.nanmax(uv[:, 1]):.3f}")
+        return cands if cnt == vcount else None
+
+    def export(kind, idx, si, extra):
+        vbs, vcount, pos, tris = section_geometry(si)
+        print(f"      {kind} {idx}: section {si}, {vcount} verts, {len(tris)} triangles, vertex buffers {vbs}")
+        found = {}
+        seen = {vbs[0], -1}
+        for k in range(1, 8):
+            if vbs[k] in seen: continue
+            seen.add(vbs[k])
+            got = show_buffer(f"slot {k}", vbs[k], vcount)
+            if got: found.update({f"slot{k}_{n}": uv for n, uv in got.items()})
+        for label, vbi in extra:
+            if vbi in seen: continue
+            seen.add(vbi)
+            got = show_buffer(label, vbi, vcount)
+            if got: found.update({f"{label.replace(' ', '')}_{n}": uv for n, uv in got.items()})
+        for name, uv in found.items():
+            ok = np.isfinite(uv).all(1) & (uv >= -0.01).all(1) & (uv <= 1.01).all(1)
+            if ok.mean() < 0.95: continue
+            fn = os.path.join(out_dir, f"lmuv_{kind}{idx}_{name}.obj")
+            with open(fn, "w") as f:
+                for x, y, z in pos: f.write("v %.4f %.4f %.4f\n" % (x, z, -y))
+                for u, v in uv: f.write("vt %.6f %.6f\n" % (u, 1.0 - v))
+                for t in tris: f.write("f %d/%d %d/%d %d/%d\n" % (t[0] + 1, t[0] + 1, t[1] + 1, t[1] + 1, t[2] + 1, t[2] + 1))
+            print(f"        wrote {fn}")
+
+    done = 0
+    for ci, si in sorted(enumerate(clusters), key=lambda x: -(vb_info[c.i16(s_addr + SECTION_SIZE * x[1] + 24)][0] if 0 <= x[1] < n_sec else 0)):
+        if done >= 2 or not (0 <= si < n_sec): continue
+        try:
+            export("cluster", ci, si, [("block48", per_section[si] if si < len(per_section) else -1)])
+            done += 1
+        except Exception as ex:
+            print(f"      cluster {ci}: {type(ex).__name__}: {ex}")
+    try:
+        entry_i = c.resource_entry(c.i32(bsp.meta + L["instances_res"]) & 0xFFFF)
+        ibase = rt["fixup_addr"] + entry_i["fixup_offset"] + entry_i["fixups"][-10]
+        shown = 0
+        for ii, vbi in enumerate(per_instance):
+            if vbi < 0: continue
+            si = c.i16(ibase + 156 * ii + 58)
+            export("instance", ii, si, [("per-instance", vbi), ("block48", per_section[si] if 0 <= si < len(per_section) else -1)])
+            shown += 1
+            if shown >= 2: break
+        if not shown: print("      no instance has a per-instance lightmap buffer")
+    except Exception as ex:
+        print(f"      instances: {type(ex).__name__}: {ex}")
 
 def main(argv):
     import argparse
@@ -1771,7 +1953,7 @@ def main(argv):
                 except MapReadError as e:
                     print(f"bsp {bsp.path}: skipped - {e}"); continue
                 meshes = [level["sections"][si] for si in level["clusters"]]
-                for name, si, scale, mat in level["instances"]:
+                for name, si, scale, mat, _luv in level["instances"]:
                     meshes.append(transform_mesh(level["sections"][si], scale, mat))
                 out = os.path.join(a.bsp, level["name"] + ".obj")
                 write_obj(dict(path=level["path"], meshes=meshes), out)

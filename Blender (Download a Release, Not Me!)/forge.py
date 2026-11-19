@@ -1028,7 +1028,7 @@ def upgradeMaterials():
     done = 0
     for mat in bpy.data.materials:
         path = mat.get('mjolnir_shader')
-        if not path or materialVersion(mat) >= MATERIAL_VERSION: continue
+        if not path or materialVersion(mat) >= MATERIAL_VERSION or mat.get('mjolnir_sky_of') or mat.get('mjolnir_lightmapped'): continue
         if by_path is None:
             by_path = {t.path: t.index for g, ts in cache.tags_by_group.items() if g.startswith('rm') for t in ts}
         idx = by_path.get(path)
@@ -1056,6 +1056,7 @@ def buildModelMesh(name, model):
     for shader in mats: me.materials.append(shaderMaterial(shader, shader_tags.get(shader)))
     if mat_idx and len(mat_idx) == len(me.polygons):
         me.polygons.foreach_set('material_index', mat_idx)
+    loop_verts = None
     if have_uvs and verts:
         layer = me.uv_layers.new(name='UVMap')
         loop_verts = np.empty(len(me.loops), np.int64)
@@ -1063,6 +1064,12 @@ def buildModelMesh(name, model):
         uv = np.asarray(uvs, np.float32)[loop_verts]
         uv[:, 1] = 1.0 - uv[:, 1]
         layer.data.foreach_set('uv', uv.ravel())
+    if verts and model['meshes'] and all(m.get('lightmap_uvs') is not None for m in model['meshes']):
+        if loop_verts is None:
+            loop_verts = np.empty(len(me.loops), np.int64)
+            me.loops.foreach_get('vertex_index', loop_verts)
+        luv = np.concatenate([np.asarray(m['lightmap_uvs'], np.float32) for m in model['meshes']])
+        me.uv_layers.new(name='Lightmap').data.foreach_set('uv', luv[loop_verts].ravel())
     me.validate()
     if have_normals and len(normals) == len(me.vertices):
         try: me.normals_split_custom_set_from_vertices(normals)
@@ -1101,7 +1108,7 @@ def mapTitle(key):
     return key.replace('_', ' ').title()
 
 def copySceneSettings(src, dst):
-    for prop in ('scaleConvention', 'readMapPalette', 'extractModels', 'extractTextures', 'importLevel', 'mapFileOverride', 'extraMapFolders'):
+    for prop in ('scaleConvention', 'readMapPalette', 'extractModels', 'extractTextures', 'importLevel', 'mapFileOverride', 'extraMapFolders', 'gameLighting', 'bakedLighting'):
         try:
             if src.forge.is_property_set(prop):  # copy real choices only, so defaults stay defaults
                 setattr(dst.forge, prop, getattr(src.forge, prop))
@@ -1124,14 +1131,30 @@ def buildLevel(scene, title, log=print):
         coll = bpy.data.collections.new(level['name'])
         root.children.link(coll)
         tags = level['shader_tags']
-        if level['clusters']:
-            me = buildModelMesh(level['name'] + " clusters", dict(meshes=[level['sections'][c] for c in level['clusters']], shader_tags=tags))
-            ob = bpy.data.objects.new(level['name'] + " clusters", me); coll.objects.link(ob); count += 1
+        baked = bakedLightmap(level, log)   # (image, brightness, uv converter) or None
+        def lit(mesh, luv):
+            if baked is None or luv is None: return None
+            mesh = dict(mesh); mesh['lightmap_uvs'] = baked[2](luv); return mesh
+        groups = {}
+        for c in level['clusters']:
+            sec = level['sections'][c]
+            m = lit(sec, sec.get('lightmap_uvs'))
+            groups.setdefault(m is not None, []).append(m or sec)
+        for is_lit, meshes in groups.items():
+            nm = level['name'] + (" clusters (baked light)" if is_lit else " clusters")
+            me = buildModelMesh(nm, dict(meshes=meshes, shader_tags=tags))
+            if is_lit: applyLightmap(me, baked)
+            ob = bpy.data.objects.new(nm, me); coll.objects.link(ob); count += 1
         shared = {}
-        for name, si, scale, m in level['instances']:
-            me = shared.get(si)
-            if me is None:
-                me = shared[si] = buildModelMesh("%s %s" % (level['name'], name or si), dict(meshes=[level['sections'][si]], shader_tags=tags))
+        for name, si, scale, m, luv in level['instances']:
+            lm_mesh = lit(level['sections'][si], luv)
+            if lm_mesh is not None:
+                me = buildModelMesh("%s %s" % (level['name'], name or si), dict(meshes=[lm_mesh], shader_tags=tags))
+                applyLightmap(me, baked)
+            else:
+                me = shared.get(si)
+                if me is None:
+                    me = shared[si] = buildModelMesh("%s %s" % (level['name'], name or si), dict(meshes=[level['sections'][si]], shader_tags=tags))
             ob = bpy.data.objects.new(name or "instance", me)
             ob.matrix_world = Matrix(((m[0] * scale, m[3] * scale, m[6] * scale, m[9]),
                                       (m[1] * scale, m[4] * scale, m[7] * scale, m[10]),
@@ -1141,7 +1164,88 @@ def buildLevel(scene, title, log=print):
         log("Level %s: %d clusters, %d instances in %.1fs" % (level['name'], len(level['clusters']), len(level['instances']), time.time() - t0))
     return count
 
-LEVEL_VERSION = 2  # 2: large BSPs (>4096 buffers) + checked index decoding. Older builds are rebuilt.
+LEVEL_VERSION = 3  # 2: large BSPs (>4096 buffers) + checked index decoding. 3: baked lightmaps. Older builds are rebuilt.
+
+def bakedLightmap(level, log=print):
+    """The level's baked lighting, if it can be used: (image, brightness, uv converter) or None.
+    Checks that the lightmap coordinates line up with the lightmap image before using it."""
+    info = level.get('lightmap')
+    sc = bpy.context.scene
+    if not info or not sc.forge.bakedLighting or not sc.forge.extractTextures: return None
+    cache = palette['cache']
+    try:
+        px = cache.read_bitmap(info['bitmap'])['pixels']
+        meshes = [level['sections'][c] for c in level['clusters'] if level['sections'][c].get('lightmap_uvs') is not None]
+        meshes += [dict(lightmap_uvs=i[4], triangles=level['sections'][i[1]]['triangles']) for i in level['instances'] if i[4] is not None]
+        if not meshes: return None
+        o = mapreader.lightmap_orientation(px, meshes)
+        log("Lightmap check %s: %s" % (level['name'], {k: o.get(k) for k in ('ok', 'score', 'baseline', 'blank', 'flip_u', 'v_from_top')}))
+        if not o['ok']:
+            log("Baked lighting for %s didn't line up with the geometry; using sun lighting instead" % level['name'])
+            return None
+        img = bitmapImage(info['bitmap'], 'color')
+    except Exception as e:
+        log("Baked lighting for %s skipped: %s" % (level['name'], e)); return None
+    fu, vt = o['flip_u'], o['v_from_top']
+    def convert(uv):
+        uv = np.array(uv, np.float32, copy=True)
+        if fu: uv[:, 0] = 1.0 - uv[:, 0]
+        if vt: uv[:, 1] = 1.0 - uv[:, 1]   # Blender images start at the bottom row
+        return uv
+    brightness = info.get('brightness') or 0.0
+    if not (0.5 < brightness < 64.0): brightness = 6.0
+    return img, brightness, convert
+
+def lightmappedMaterial(mat, img, brightness):
+    """Copy of a level material lit by the baked lightmap (unlit otherwise, like the game)."""
+    key = '%s|lm|%s' % (mat.name, img.name)
+    for m in bpy.data.materials:
+        if m.get('mjolnir_lightmapped') == key and m.get('mjolnir_textured') == mat.get('mjolnir_textured'): return m
+    lm = mat.copy(); lm.name = mat.name + " (baked)"
+    lm['mjolnir_lightmapped'] = key
+    if 'mjolnir_shader' in lm: del lm['mjolnir_shader']
+    if lm.node_tree is None: return lm
+    nodes, links = lm.node_tree.nodes, lm.node_tree.links
+    bsdf = next((n for n in nodes if n.type == 'BSDF_PRINCIPLED'), None)
+    out = next((n for n in nodes if n.type == 'OUTPUT_MATERIAL'), None)
+    if bsdf is None or out is None: return lm
+    surf = out.inputs['Surface']
+    if surf.links and surf.links[0].from_node.type == 'ADD_SHADER': return lm   # glows stay glows
+    x, y = bsdf.location.x, bsdf.location.y - 600
+    uvn = nodes.new('ShaderNodeUVMap'); uvn.uv_map = 'Lightmap'; uvn.location = (x - 700, y)
+    tex = nodes.new('ShaderNodeTexImage'); tex.image = img; tex.label = 'baked lightmap'; tex.location = (x - 500, y)
+    links.new(uvn.outputs['UV'], tex.inputs['Vector'])
+    scale = nodes.new('ShaderNodeVectorMath'); scale.operation = 'SCALE'; scale.location = (x - 200, y)
+    scale.label = 'Lightmap Brightness'; scale.inputs['Scale'].default_value = brightness
+    links.new(tex.outputs['Color'], scale.inputs[0])
+    mul = nodes.new('ShaderNodeVectorMath'); mul.operation = 'MULTIPLY'; mul.location = (x, y)
+    if bsdf.inputs['Base Color'].links: links.new(bsdf.inputs['Base Color'].links[0].from_socket, mul.inputs[0])
+    else: mul.inputs[0].default_value = tuple(bsdf.inputs['Base Color'].default_value)[:3]
+    links.new(scale.outputs[0], mul.inputs[1])
+    color = mul.outputs[0]
+    e_col = bsdfInput(bsdf, 'Emission Color', 'Emission')
+    if e_col is not None and e_col.links:   # self-illumination adds on top
+        e_str = bsdfInput(bsdf, 'Emission Strength')
+        si = nodes.new('ShaderNodeVectorMath'); si.operation = 'SCALE'; si.location = (x, y - 150)
+        links.new(e_col.links[0].from_socket, si.inputs[0]); si.inputs['Scale'].default_value = e_str.default_value if e_str else 1.0
+        add = nodes.new('ShaderNodeVectorMath'); add.operation = 'ADD'; add.location = (x + 150, y)
+        links.new(color, add.inputs[0]); links.new(si.outputs[0], add.inputs[1]); color = add.outputs[0]
+    emit = nodes.new('ShaderNodeEmission'); emit.location = (x + 300, y)
+    links.new(color, emit.inputs['Color'])
+    shader = emit.outputs[0]
+    if bsdf.inputs['Alpha'].links:
+        tr = nodes.new('ShaderNodeBsdfTransparent'); tr.location = (x + 300, y - 150)
+        mx = nodes.new('ShaderNodeMixShader'); mx.location = (x + 500, y)
+        links.new(bsdf.inputs['Alpha'].links[0].from_socket, mx.inputs[0])
+        links.new(tr.outputs[0], mx.inputs[1]); links.new(emit.outputs[0], mx.inputs[2])
+        shader = mx.outputs[0]
+    links.new(shader, surf)
+    return lm
+
+def applyLightmap(me, baked):
+    img, brightness, _ = baked
+    for i, m in enumerate(me.materials):
+        if m is not None: me.materials[i] = lightmappedMaterial(m, img, brightness)
 
 def removeLevel(scene):
     """Delete a scene's generated level collection (objects, then now-unused meshes)."""
@@ -1256,6 +1360,7 @@ def skyMaterial(mat):
             del m['mjolnir_sky_of']
     sky = mat.copy(); sky.name = mat.name + " (sky)"
     sky['mjolnir_sky_of'] = key
+    if 'mjolnir_shader' in sky: del sky['mjolnir_shader']   # a copy: never picked up or re-textured as the shader's material
     sky['mjolnir_sky_version'] = SKY_VERSION
     if sky.node_tree is None: return sky
     nodes, links = sky.node_tree.nodes, sky.node_tree.links
@@ -2498,6 +2603,8 @@ class ForgeSceneProps(bpy.types.PropertyGroup):
         description="Give each map a scene with its level geometry read from the .map, and show it as the backdrop of the scene you import into")
     extractTextures: BoolProperty(name="Extract Textures", default=True,
         description="Read textures and shader colours from the .map for extracted models (stored inside the .blend)")
+    bakedLighting: BoolProperty(name="Baked Lighting", default=True,
+        description="Light the map's level geometry with its baked lightmaps from the .map, like the game (experimental). Off = sun lighting")
     gameLighting: BoolProperty(name="Game Lighting", default=True,
         description="On import, add the map's sky and set up EEVEE lighting (sun, sky-coloured ambient light, shadows, AO) so it looks closer to the game")
     mapFileOverride: StringProperty(name="Map File", subtype='FILE_PATH', default="",
@@ -2528,6 +2635,7 @@ class ForgeScenePanel(bpy.types.Panel):
         row = col.row(align=True)
         row.prop(sceneProps, 'gameLighting')
         row.operator(SetupGameLighting.bl_idname, text="", icon='LIGHT_SUN')
+        col.prop(sceneProps, 'bakedLighting')
         col.prop(sceneProps, 'mapFileOverride')
         col.prop(sceneProps, 'extraMapFolders')
         col.prop(sceneProps, 'renderThumbnails')
