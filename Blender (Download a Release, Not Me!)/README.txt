@@ -16,11 +16,11 @@ When you press File > Import > Forge Objects, Mjolnir now:
   4. Gives those models their textures from the .map: base colour (with the shader's tint),
      normal map and self-illumination. Images are packed into the .blend, so each texture is
      decoded once; the first import of a textured vehicle takes a few seconds longer.
-  5. Shows the loaded map behind your forge objects, the same way forge.blend shows Forge World.
-     The first time you import on a map (e.g. Boneyard), its textured level geometry is read from
-     the .map into its own scene (geometry only, like the "Forge World" scene). Your working scene's
-     unselectable "Map" backdrop is then pointed at that map, and forge objects are imported into the
-     working scene. Forge World keeps using forge.blend's hand-made Forge World geometry.
+  5. Shows the loaded map behind your forge objects. The first time you import on a map (Forge World
+     included), its textured level geometry and sky are read from the .map into their own scene. Your
+     working scene's unselectable "Map" backdrop is then pointed at that map, and forge objects are
+     imported into the working scene. (forge.blend no longer ships a hand-made Forge World: it's built
+     from forge_halo.map like every other map, which keeps the download about 19 MB smaller.)
 
   6. Add > Forge Object... opens a search with a preview: type to filter, click an item to see a
      large thumbnail of it, then Enter or Add places it at the 3D cursor. Stock items come with

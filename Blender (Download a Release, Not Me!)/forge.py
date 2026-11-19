@@ -1453,7 +1453,8 @@ def applyLightmap(me, baked):
 def removeLevel(scene):
     """Delete a scene's generated level collection (objects, then now-unused meshes)."""
     title = mapTitle(scene.get('mjolnir_map', ''))
-    for coll in [c for c in scene.collection.children if c.get('mjolnir_level') or c.name in ("%s Level" % title, "%s Level" % scene.name)]:
+    for coll in [c for c in scene.collection.children if c.get('mjolnir_level') or c.name in ("%s Level" % title, "%s Level" % scene.name)
+                 or (scene.get('mjolnir_level_handmade') and c.name == scene.name)]:
         meshes = set()
         for ob in list(coll.all_objects):
             if ob.type == 'MESH': meshes.add(ob.data)
@@ -1465,7 +1466,7 @@ def removeLevel(scene):
             if me.users == 0: bpy.data.meshes.remove(me)
 
 def levelCollection(sc):
-    """The collection holding a map scene's geometry (built level, or forge.blend's hand-made 'Forge World')."""
+    """The collection holding a map scene's geometry (built level, or an older forge.blend's hand-made 'Forge World')."""
     for c in sc.collection.children:
         if c.get('mjolnir_level'): return c
     for name in ("%s Level" % sc.name, sc.name):
@@ -1523,23 +1524,21 @@ def ensureMapScene(context, log=print):
     for sc in bpy.data.scenes:
         if sc.get('mjolnir_map') != key: continue
         baked = bool(context.scene.forge.bakedLighting)
-        if sc.get('mjolnir_level_handmade') or (sc.get('mjolnir_level_version', 1) >= LEVEL_VERSION and bool(sc.get('mjolnir_baked', baked)) == baked):
+        if not sc.get('mjolnir_level_handmade') and sc.get('mjolnir_level_version', 1) >= LEVEL_VERSION and bool(sc.get('mjolnir_baked', baked)) == baked:
             return sc, 0
         log("Rebuilding %s level" % sc.name)
         removeLevel(sc)
+        if 'mjolnir_level_handmade' in sc: del sc['mjolnir_level_handmade']
         built = buildLevel(sc, mapTitle(key), log)
         sc['mjolnir_level_version'] = LEVEL_VERSION
         sc['mjolnir_baked'] = bool(context.scene.forge.bakedLighting)
         sc['mjolnir_sky_version'] = 0   # the sky lived in the removed level collection
         return sc, built
     cur = context.scene
-    if key == 'forge_halo':  # forge.blend's own Forge World scene (hand-made level): adopt it
-        sc = bpy.data.scenes.get('Forge World')
-        if sc is not None and sc.get('mjolnir_map') is None and levelCollection(sc) is not None:
-            sc['mjolnir_map'] = key
-            sc['mjolnir_level_handmade'] = True
-            return sc, 0
     title = mapTitle(key)
+    old = bpy.data.scenes.get(title)
+    if old is not None and old.get('mjolnir_map') is None and levelCollection(old) is not None and old != cur:
+        bpy.data.scenes.remove(old)   # an older forge.blend's hand-made Forge World: replaced by the map's own
     sc = bpy.data.scenes.new(title)
     sc['mjolnir_map'] = key
     copySceneSettings(cur, sc)
