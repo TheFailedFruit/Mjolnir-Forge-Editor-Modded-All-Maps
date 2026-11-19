@@ -1234,7 +1234,12 @@ def _bsp_methods(cls):
         report["lightmapped_instances"] = sum(1 for i in inst_out if i[4] is not None)
         lightmap_info = None
         if lm_bitmap is not None:
-            lightmap_info = dict(bitmap=lm_bitmap, brightness=self.f32(lightmap.meta + 0x18))
+            lightmap_info = dict(bitmap=lm_bitmap, brightness=self.f32(lightmap.meta + 0x18), primary=None)
+            try:
+                pt = self.tag_ref(lightmap.meta + LBSP_PRIMARY_MAP)
+                if pt is not None and pt.group == "bitm": lightmap_info["primary"] = pt.index
+            except MapReadError:
+                pass
         return dict(name=bsp.path.replace("\\", "/").split("/")[-1], path=bsp.path, sections=meshes,
                     clusters=[c for c in clusters if c in meshes],
                     instances=inst_out, shader_tags=shader_tags, report=report, lightmap=lightmap_info)

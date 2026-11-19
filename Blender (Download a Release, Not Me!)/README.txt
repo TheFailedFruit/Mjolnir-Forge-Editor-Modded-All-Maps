@@ -33,11 +33,12 @@ When you press File > Import > Forge Objects, Mjolnir now:
      tweaks are kept; the sun button next to the setting re-applies it (and rebuilds the sky).
      Materials now use more of Halo's shader: detail maps, terrain blending of up to four layers
      (with their normal maps), and specular strength / roughness from the shader's own values.
-     Baked Lighting (experimental, on by default): the level is lit with the map's own baked lightmaps
-     read from the .map, like the game. The importer first checks that the lightmap lines up with the
-     geometry and falls back to sun lighting if it doesn't (the import log says which). Forge objects
-     are lit by the sun; rotate the "Sun" object to match the map's shadows. The exposure is set
-     automatically; use the Baked Brightness slider if the level looks too bright or dark.
+     Baked Lighting (experimental, on by default): the level is lit like the game from the map's own
+     lightmaps: baked indirect/sky light plus the sun, with the game's baked sun shadows. The sun's
+     direction is worked out from those baked shadows, so Blender's sun (which lights forge objects)
+     matches the map, and forge objects cast real-time shadows onto the level. The importer first checks
+     that the lightmap lines up with the geometry and falls back to plain sun lighting if it doesn't.
+     Rotate the "Sun" and press Set Up Game Lighting to change the sun direction yourself.
 
 Models extracted by an earlier version of this patch are rebuilt automatically on the next import.
 
@@ -102,9 +103,9 @@ Limits
   normal maps, specular strength/roughness, self-illumination, alpha test/blend. Team colour
   (change colour), cube-map reflections and detail normal maps aren't reproduced. Additive shaders
   (glows) show as emission.
-- Baked lighting uses the lightmap's main colour layer only (not its directional data), so bump
-  detail on the level is flatter than in game. Levels whose lightmap doesn't pass the check, and all
-  forge objects, use the sun + sky-coloured ambient light instead.
+- Baked lighting doesn't use the lightmap's directional detail for the indirect light, so bump detail
+  in shade is flatter than in game; specular highlights aren't drawn on baked surfaces. Real-time
+  object shadows on the level need EEVEE (Cycles shows the baked shadows only).
 - Cube maps and 3D textures are skipped. The level's placed scenery/machines aren't built yet,
   only the level geometry and sky.
 - Models use the variant's permutations, else the "default"/first permutation of each region.

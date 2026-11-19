@@ -1145,7 +1145,8 @@ def copySceneSettings(src, dst):
 def buildLevel(scene, title, log=print):
     """Create the level geometry (clusters + instanced geometry) of every BSP into scene. Returns object count."""
     cache = palette['cache']
-    if 'mjolnir_ambient' in scene: del scene['mjolnir_ambient']
+    for k in ('mjolnir_ambient', 'mjolnir_sun_dir'):
+        if k in scene: del scene[k]
     root = bpy.data.collections.new("%s Level" % title)
     root['mjolnir_level'] = True
     scene.collection.children.link(root)
@@ -1160,10 +1161,10 @@ def buildLevel(scene, title, log=print):
         coll = bpy.data.collections.new(level['name'])
         root.children.link(coll)
         tags = level['shader_tags']
-        baked = bakedLightmap(level, log, scene)   # (image, brightness, uv converter) or None
+        baked = bakedLightmap(level, log, scene)
         def lit(mesh, luv):
             if baked is None or luv is None: return None
-            mesh = dict(mesh); mesh['lightmap_uvs'] = baked[2](luv); return mesh
+            mesh = dict(mesh); mesh['lightmap_uvs'] = baked['convert'](luv); return mesh
         groups = {}
         for c in level['clusters']:
             sec = level['sections'][c]
@@ -1204,6 +1205,14 @@ def buildLevel(scene, title, log=print):
                                       (m[2] * scale, m[5] * scale, m[8] * scale, m[11]),
                                       (0, 0, 0, 1)))
             coll.objects.link(ob); count += 1
+        if baked is not None and baked.get('pimg') is not None:
+            try:
+                d, score = estimateSunDirection(baked, coll.objects, log)
+                if d is not None and score >= 0.7:
+                    scene['mjolnir_sun_dir'] = d
+                    updateBakedMaterials(sun_dir=d)
+            except Exception as e:
+                log("Sun direction for %s not found: %s" % (level['name'], e))
         log("Level %s: %d clusters, %d instances in %.1fs" % (level['name'], len(level['clusters']), len(level['instances']), time.time() - t0))
     try:
         curves, means = {}, []
@@ -1217,11 +1226,20 @@ def buildLevel(scene, title, log=print):
         pass
     return count
 
-LEVEL_VERSION = 7  # 7: stores the level's ambient light for lighting objects. 6: 6: clusters decide lightmap orientation. 5: 5: lightmap orientation fixed. 2: large BSPs (>4096 buffers) + checked index decoding. 3: baked lightmaps. 4: lightmap exposure. Older builds are rebuilt.
+LEVEL_VERSION = 8  # 8: baked sun shadows, sun direction, object shadows on the level. 7: 7: stores the level's ambient light for lighting objects. 6: 6: clusters decide lightmap orientation. 5: 5: lightmap orientation fixed. 2: large BSPs (>4096 buffers) + checked index decoding. 3: baked lightmaps. 4: lightmap exposure. Older builds are rebuilt.
+
+SUN_IRRADIANCE = 0.9                 # direct sun on a surface facing it, relative to the level's average light
+SUN_COLOR = (1.0, 0.93, 0.82)
+AMBIENT_LEVEL = 0.5                  # average indirect light the level gets (lightmap scaled to this)
+DEFAULT_SUN = (0.38, 0.31, 0.87)     # direction towards the sun when a map's can't be worked out
+
+def _srgb_to_linear(c): return np.where(c <= 0.04045, c / 12.92, ((c + 0.055) / 1.055) ** 2.4)
 
 def bakedLightmap(level, log=print, scene=None):
-    """The level's baked lighting, if it can be used: (image, brightness, uv converter) or None.
-    Checks that the lightmap coordinates line up with the lightmap image before using it."""
+    """The level's baked lighting, if it can be used, as a dict (or None). Reach stores, per lightmap texel,
+    the indirect/sky light (intensity layer 0 colour) and how much of the sun reaches it (primary map
+    alpha); the sun itself is added at runtime from a direction. Checks that the lightmap coordinates
+    line up with the lightmap before using it."""
     info = level.get('lightmap')
     sc = bpy.context.scene
     if not info or not sc.forge.bakedLighting or not sc.forge.extractTextures: return None
@@ -1240,45 +1258,101 @@ def bakedLightmap(level, log=print, scene=None):
             return None
         img = bitmapImage(info['bitmap'], 'color')
         linear = img.colorspace_settings.name == 'Non-Color'
+        pimg, ppx = None, None
+        if info.get('primary') is not None:
+            try:
+                pimg = bitmapImage(info['primary'], 'data')
+                ppx = cache.read_bitmap(info['primary'])['pixels']
+            except Exception as e:
+                log("Sun shadow map for %s skipped: %s" % (level['name'], e))
     except Exception as e:
         log("Baked lighting for %s skipped: %s" % (level['name'], e)); return None
     fu, vt = o['flip_u'], o['v_from_top']
+    H, W = px.shape[:2]
     def convert(uv):
         uv = np.array(uv, np.float32, copy=True)
         if fu: uv[:, 0] = 1.0 - uv[:, 0]
         if vt: uv[:, 1] = 1.0 - uv[:, 1]   # Blender images start at the bottom row
         return uv
-    # exposure: scale so the average lit vertex gets about the light a sunny surface gets (1.0)
-    lums, cols = [], []
+    def texel(uv, img_px):
+        u = 1.0 - uv[:, 0] if fu else uv[:, 0]
+        v = uv[:, 1] if vt else 1.0 - uv[:, 1]
+        h, w = img_px.shape[:2]
+        return img_px[np.clip((v * h).astype(np.int64), 0, h - 1), np.clip((u * w).astype(np.int64), 0, w - 1)] / 255.0
+    cols = []
     for m in meshes:
         uv = np.asarray(m['lightmap_uvs'], np.float32)
         uv = uv[(uv >= 0).all(1) & (uv <= 1).all(1)]
         if not len(uv): continue
-        u = 1.0 - uv[:, 0] if fu else uv[:, 0]
-        v = uv[:, 1] if vt else 1.0 - uv[:, 1]
-        H, W = px.shape[:2]
-        c = px[np.clip((v * H).astype(np.int64), 0, H - 1), np.clip((u * W).astype(np.int64), 0, W - 1), :3] / 255.0
-        if not linear: c = np.where(c <= 0.04045, c / 12.92, ((c + 0.055) / 1.055) ** 2.4)
-        lums.append(c @ np.array([0.2126, 0.7152, 0.0722])); cols.append(c)
-    mean = float(np.concatenate(lums).mean()) if lums else 0.0
-    tag_brightness = info.get('brightness') or 0.0
-    brightness = min(64.0, max(0.5, 1.0 / mean)) if mean > 1e-4 else 6.0
-    log("Baked lighting %s: average lightmap value %.3f, tag brightness %.2f, using x%.2f" % (level['name'], mean, tag_brightness, brightness))
-    if scene is not None and cols:
-        # the level's own average light, for lighting forge objects to match: shadowed parts get roughly
-        # the darker half of it from the world, the sun adds the rest
-        c = np.concatenate(cols) * brightness
-        lum = c @ np.array([0.2126, 0.7152, 0.0722])
-        dark = c[lum <= np.median(lum)].mean(0)
-        dl = float(dark @ np.array([0.2126, 0.7152, 0.0722]))
-        if dl > 0.6: dark = dark * (0.6 / dl)       # keep shade from glowing
-        elif 0 < dl < 0.15: dark = dark * (0.15 / dl)
-        scene['mjolnir_ambient'] = tuple(float(v) for v in np.clip(dark, 0.02, 1.0))
-    return img, brightness, convert
+        c = texel(uv, px)[:, :3]
+        cols.append(c if linear else _srgb_to_linear(c))
+    if not cols: return None
+    cols = np.concatenate(cols)
+    lum = float((cols @ np.array([0.2126, 0.7152, 0.0722])).mean())
+    ambient_scale = min(64.0, max(0.25, AMBIENT_LEVEL / lum)) if lum > 1e-4 else 1.0
+    ambient = cols.mean(0) * ambient_scale
+    log("Baked lighting %s: average lightmap value %.3f, tag brightness %.2f, using x%.2f, sun shadows %s"
+        % (level['name'], lum, info.get('brightness') or 0.0, ambient_scale, "yes" if pimg is not None else "no"))
+    if scene is not None:
+        scene['mjolnir_ambient'] = tuple(float(v) for v in np.clip(ambient, 0.02, 1.0))
+    return dict(img=img, pimg=pimg, ppx=ppx, scale=ambient_scale, convert=convert, texel=texel, meshes=meshes,
+                ambient=tuple(float(v) for v in ambient))
 
-def lightmappedMaterial(mat, img, brightness):
-    """Copy of a level material lit by the baked lightmap (unlit otherwise, like the game)."""
-    key = '%s|lm|%s' % (mat.name, img.name)
+def estimateSunDirection(baked, objects, log=print):
+    """Find the sun direction that explains the baked sun shadows: from points on upward-facing ground the
+    lightmap says are sunlit or shadowed, cast rays towards candidate directions through the level and keep
+    the direction that agrees best. Returns (direction towards the sun, agreement) or (None, 0)."""
+    from mathutils.bvhtree import BVHTree
+    if baked.get('ppx') is None: return None, 0.0
+    lit, shade = [], []
+    for m in baked['meshes']:
+        luv = m.get('lightmap_uvs'); P = np.asarray(m.get('positions'), np.float64)
+        if luv is None or not len(P): continue
+        luv = np.asarray(luv, np.float64); t = np.asarray(m['triangles'], np.int64)
+        t = t[(t < len(luv)).all(1)]; t = t[(luv[t] >= 0).all(2).all(1)]
+        if not len(t): continue
+        fn = np.cross(P[t[:, 1]] - P[t[:, 0]], P[t[:, 2]] - P[t[:, 0]]); a = np.linalg.norm(fn, axis=1)
+        ok = a > 1e-6; t, fn, a = t[ok], fn[ok] / a[ok, None], a[ok]
+        up = fn[:, 2] > 0.8
+        vis = baked['texel'](luv[t].mean(1), baked['ppx'])[:, 3]
+        cen = P[t].mean(1) + fn * 0.05
+        lit.append(cen[up & (vis > 0.9)]); shade.append(cen[up & (vis < 0.1)])
+    lit = np.concatenate(lit) if lit else np.zeros((0, 3)); shade = np.concatenate(shade) if shade else np.zeros((0, 3))
+    if len(lit) < 30 or len(shade) < 30: return None, 0.0
+    rng = np.random.default_rng(0)
+    lit = lit[rng.choice(len(lit), min(300, len(lit)), replace=False)]
+    shade = shade[rng.choice(len(shade), min(300, len(shade)), replace=False)]
+    verts, polys = [], []
+    for ob in objects:
+        if ob.type != 'MESH' or not len(ob.data.vertices): continue
+        me = ob.data
+        co = np.empty(len(me.vertices) * 3, np.float64); me.vertices.foreach_get('co', co)
+        co = co.reshape(-1, 3) @ np.array(ob.matrix_world)[:3, :3].T + np.array(ob.matrix_world)[:3, 3]
+        tri = np.empty(len(me.loop_triangles) * 3, np.int64) if me.loop_triangles else None
+        if tri is None:
+            me.calc_loop_triangles(); tri = np.empty(len(me.loop_triangles) * 3, np.int64)
+        me.loop_triangles.foreach_get('vertices', tri)
+        polys.append(tri.reshape(-1, 3) + sum(len(v) for v in verts)); verts.append(co)
+    if not verts: return None, 0.0
+    tree = BVHTree.FromPolygons(np.concatenate(verts).tolist(), np.concatenate(polys).tolist(), all_triangles=True)
+    pts = [Vector(p) for p in lit] + [Vector(p) for p in shade]
+    want = [False] * len(lit) + [True] * len(shade)
+    def agreement(az, el):
+        d = Vector((cos(el) * cos(az), cos(el) * sin(az), sin(el)))
+        good = sum(1 for p, w in zip(pts, want) if (tree.ray_cast(p, d, 2000.0)[0] is not None) == w)
+        return good / len(pts)
+    best = max(((agreement(radians(az), radians(el)), az, el) for az in range(0, 360, 10) for el in range(10, 90, 8)))
+    best = max(((agreement(radians(az), radians(el)), az, el)
+                for az in range(best[1] - 8, best[1] + 9, 2) for el in range(max(4, best[2] - 6), min(89, best[2] + 7), 2)))
+    score, az, el = best
+    log("Sun direction from the baked shadows: azimuth %d, elevation %d (agrees with %.0f%% of %d sample points)" % (az, el, score * 100, len(pts)))
+    return (cos(radians(el)) * cos(radians(az)), cos(radians(el)) * sin(radians(az)), sin(radians(el))), score
+
+def lightmappedMaterial(mat, baked):
+    """Copy of a level material lit like the game: albedo x (baked indirect light + sun x baked sun
+    visibility x facing), with Blender's sun shadows (from forge objects) taken out of the sun part."""
+    img, pimg = baked['img'], baked.get('pimg')
+    key = '%s|lm2|%s' % (mat.name, img.name)
     for m in bpy.data.materials:
         if m.get('mjolnir_lightmapped') == key and m.get('mjolnir_textured') == mat.get('mjolnir_textured'): return m
     lm = mat.copy(); lm.name = mat.name + " (baked)"
@@ -1291,43 +1365,90 @@ def lightmappedMaterial(mat, img, brightness):
     if bsdf is None or out is None: return lm
     surf = out.inputs['Surface']
     if surf.links and surf.links[0].from_node.type == 'ADD_SHADER': return lm   # glows stay glows
-    x, y = bsdf.location.x, bsdf.location.y - 600
-    uvn = nodes.new('ShaderNodeUVMap'); uvn.uv_map = 'Lightmap'; uvn.location = (x - 700, y)
-    tex = nodes.new('ShaderNodeTexImage'); tex.image = img; tex.label = 'baked lightmap'; tex.location = (x - 500, y)
+    x, y = bsdf.location.x, bsdf.location.y - 700
+    def node(kind, label=None, dx=0, dy=0, **kw):
+        n = nodes.new(kind); n.location = (x + dx, y + dy)
+        if label: n.label = n.name = label
+        for k, v in kw.items(): setattr(n, k, v)
+        return n
+    def vm(op, a, b=None, dx=0, dy=0):
+        n = node('ShaderNodeVectorMath', dx=dx, dy=dy); n.operation = op
+        links.new(a, n.inputs[0])
+        if b is not None:
+            if isinstance(b, (int, float)): n.inputs['Scale'].default_value = b
+            elif op == 'SCALE': links.new(b, n.inputs['Scale'])
+            else: links.new(b, n.inputs[1])
+        return n.outputs['Value'] if op == 'DOT_PRODUCT' else n.outputs['Vector']
+    def mth(op, a, b=None, dx=0, dy=0, clamp=False):
+        n = node('ShaderNodeMath', dx=dx, dy=dy); n.operation = op; n.use_clamp = clamp
+        for i, v in enumerate((a, b)):
+            if v is None: continue
+            if isinstance(v, (int, float)): n.inputs[i].default_value = v
+            else: links.new(v, n.inputs[i])
+        return n.outputs[0]
+    def val(label, v, dx, dy):
+        n = node('ShaderNodeValue', label, dx, dy); n.outputs[0].default_value = v; return n.outputs[0]
+    uvn = node('ShaderNodeUVMap', dx=-1500); uvn.uv_map = 'Lightmap'
+    tex = node('ShaderNodeTexImage', 'baked lightmap', -1300); tex.image = img
     links.new(uvn.outputs['UV'], tex.inputs['Vector'])
-    scale = nodes.new('ShaderNodeVectorMath'); scale.operation = 'SCALE'; scale.location = (x - 200, y)
-    scale.label = 'Lightmap Brightness'; scale.name = 'Lightmap Brightness'
-    lm['mjolnir_lightmap_brightness'] = brightness
-    scale.inputs['Scale'].default_value = brightness * bpy.context.scene.forge.bakedBrightness
-    links.new(tex.outputs['Color'], scale.inputs[0])
-    mul = nodes.new('ShaderNodeVectorMath'); mul.operation = 'MULTIPLY'; mul.location = (x, y)
+    light = vm('SCALE', tex.outputs['Color'], val('Ambient Scale', baked['scale'], -1100, -150), dx=-900)
+    if pimg is not None:
+        ptex = node('ShaderNodeTexImage', 'baked sun visibility', -1300, -300); ptex.image = pimg
+        links.new(uvn.outputs['UV'], ptex.inputs['Vector'])
+        nrm = bsdf.inputs['Normal'].links[0].from_socket if bsdf.inputs['Normal'].links else node('ShaderNodeNewGeometry', dx=-1300, dy=-600).outputs['Normal']
+        sdir = node('ShaderNodeCombineXYZ', 'Sun Direction', -1300, -800)
+        for i, v in enumerate(DEFAULT_SUN): sdir.inputs[i].default_value = v
+        facing = mth('MAXIMUM', vm('DOT_PRODUCT', nrm, sdir.outputs['Vector'], dx=-1100, dy=-700), 0.0, dx=-900, dy=-700)
+        # Blender's shadows (forge objects blocking the sun): diffuse light here vs what it would be unblocked
+        diff = node('ShaderNodeBsdfDiffuse', dx=-1300, dy=-1000); diff.inputs['Color'].default_value = (1, 1, 1, 1)
+        links.new(nrm, diff.inputs['Normal'])
+        s2r = node('ShaderNodeShaderToRGB', dx=-1100, dy=-1000); links.new(diff.outputs[0], s2r.inputs[0])
+        bw = node('ShaderNodeRGBToBW', dx=-950, dy=-1000); links.new(s2r.outputs['Color'], bw.inputs[0])
+        expected = mth('MULTIPLY', facing, val('Sun Irradiance', SUN_IRRADIANCE * (0.2126 * SUN_COLOR[0] + 0.7152 * SUN_COLOR[1] + 0.0722 * SUN_COLOR[2]), -1100, -1200), dx=-800, dy=-1150)
+        rt = mth('DIVIDE', mth('SUBTRACT', bw.outputs[0], val('Ambient Level', AMBIENT_LEVEL, -1100, -1300), dx=-800, dy=-1000),
+                 mth('MAXIMUM', expected, 0.02, dx=-650, dy=-1150), dx=-500, dy=-1000, clamp=True)
+        rt = mth('MAXIMUM', rt, mth('LESS_THAN', bw.outputs[0], 0.00001, dx=-500, dy=-1200), dx=-350, dy=-1000)  # Cycles: no Shader to RGB -> unshadowed
+        sun = mth('MULTIPLY', mth('MULTIPLY', ptex.outputs['Alpha'], facing, dx=-700, dy=-500), rt, dx=-350, dy=-600)
+        sun = mth('MULTIPLY', sun, SUN_IRRADIANCE, dx=-200, dy=-600)
+        scol = node('ShaderNodeCombineXYZ', 'Sun Color', -350, -800)
+        for i, v in enumerate(SUN_COLOR): scol.inputs[i].default_value = v
+        light = vm('ADD', light, vm('SCALE', scol.outputs['Vector'], sun, dx=-100, dy=-700), dx=0, dy=-300)
+    bright = node('ShaderNodeVectorMath', 'Lightmap Brightness', 150, -300); bright.operation = 'SCALE'
+    links.new(light, bright.inputs[0]); bright.inputs['Scale'].default_value = bpy.context.scene.forge.bakedBrightness
+    lm['mjolnir_lightmap_brightness'] = 1.0
+    mul = node('ShaderNodeVectorMath', dx=300); mul.operation = 'MULTIPLY'
     if bsdf.inputs['Base Color'].links: links.new(bsdf.inputs['Base Color'].links[0].from_socket, mul.inputs[0])
     else: mul.inputs[0].default_value = tuple(bsdf.inputs['Base Color'].default_value)[:3]
-    links.new(scale.outputs[0], mul.inputs[1])
-    color = mul.outputs[0]
+    links.new(bright.outputs[0], mul.inputs[1])
+    color = mul.outputs['Vector']
     e_col = bsdfInput(bsdf, 'Emission Color', 'Emission')
     if e_col is not None and e_col.links:   # self-illumination adds on top
         e_str = bsdfInput(bsdf, 'Emission Strength')
-        si = nodes.new('ShaderNodeVectorMath'); si.operation = 'SCALE'; si.location = (x, y - 150)
-        links.new(e_col.links[0].from_socket, si.inputs[0]); si.inputs['Scale'].default_value = e_str.default_value if e_str else 1.0
-        add = nodes.new('ShaderNodeVectorMath'); add.operation = 'ADD'; add.location = (x + 150, y)
-        links.new(color, add.inputs[0]); links.new(si.outputs[0], add.inputs[1]); color = add.outputs[0]
-    emit = nodes.new('ShaderNodeEmission'); emit.location = (x + 300, y)
-    links.new(color, emit.inputs['Color'])
+        color = vm('ADD', color, vm('SCALE', e_col.links[0].from_socket, e_str.default_value if e_str else 1.0, dx=300, dy=-150), dx=450)
+    emit = node('ShaderNodeEmission', dx=600); links.new(color, emit.inputs['Color'])
     shader = emit.outputs[0]
     if bsdf.inputs['Alpha'].links:
-        tr = nodes.new('ShaderNodeBsdfTransparent'); tr.location = (x + 300, y - 150)
-        mx = nodes.new('ShaderNodeMixShader'); mx.location = (x + 500, y)
+        tr = node('ShaderNodeBsdfTransparent', dx=600, dy=-150)
+        mx = node('ShaderNodeMixShader', dx=800)
         links.new(bsdf.inputs['Alpha'].links[0].from_socket, mx.inputs[0])
         links.new(tr.outputs[0], mx.inputs[1]); links.new(emit.outputs[0], mx.inputs[2])
         shader = mx.outputs[0]
     links.new(shader, surf)
     return lm
 
+def updateBakedMaterials(sun_dir=None, ambient=None):
+    """Push the sun direction / ambient level into every baked material (after the sun moves)."""
+    for m in bpy.data.materials:
+        if not m.get('mjolnir_lightmapped') or m.node_tree is None: continue
+        n = m.node_tree.nodes
+        if sun_dir is not None and n.get('Sun Direction'):
+            for i in range(3): n['Sun Direction'].inputs[i].default_value = sun_dir[i]
+        if ambient is not None and n.get('Ambient Level'):
+            n['Ambient Level'].outputs[0].default_value = ambient
+
 def applyLightmap(me, baked):
-    img, brightness, _ = baked
     for i, m in enumerate(me.materials):
-        if m is not None: me.materials[i] = lightmappedMaterial(m, img, brightness)
+        if m is not None: me.materials[i] = lightmappedMaterial(m, baked)
 
 def removeLevel(scene):
     """Delete a scene's generated level collection (objects, then now-unused meshes)."""
@@ -1432,7 +1553,7 @@ def ensureMapScene(context, log=print):
 
 # ---- sky and lighting ------------------------------------------------------------------------
 SKY_VERSION = 3  # 3: rebuilt with 3-channel self-illum. 2: sky uses self-illumination (Reach skies are mostly self-lit)
-LIGHTING_VERSION = 2  # 2: ambient from the baked lightmap / normalised sky colour
+LIGHTING_VERSION = 3  # 3: sun direction + strength from the baked lighting. 2: 2: ambient from the baked lightmap / normalised sky colour
 SKY_DEFAULT_COLOR = (0.42, 0.55, 0.75)
 
 def skyMaterial(mat):
@@ -1583,6 +1704,24 @@ def lightingSun(scene):
     trySet(sun.data, shadow_cascade_max_distance=600.0, shadow_cascade_count=4)
     return sun
 
+def syncMapSun(scene, mapScene):
+    """Match the sun to a baked map: its strength/colour, and the direction found from its baked shadows
+    (only when that direction changes, so a sun you rotated yourself stays). Baked materials then follow
+    the working scene's sun, so rotating it and pressing Set Up Game Lighting moves the sun shading too."""
+    suns = [o for sc in (scene, mapScene) if sc is not None for o in sc.objects if o.get('mjolnir_sun')]
+    if not suns: return
+    if mapScene is not None and mapScene.get('mjolnir_ambient'):
+        d = tuple(mapScene['mjolnir_sun_dir']) if mapScene.get('mjolnir_sun_dir') else None
+        for sun in suns:
+            trySet(sun.data, energy=SUN_IRRADIANCE * pi, color=SUN_COLOR)
+            if d is not None and tuple(round(v, 4) for v in sun.get('mjolnir_sun_from', ())) != tuple(round(v, 4) for v in d):
+                sun.rotation_euler = Vector((0.0, 0.0, 1.0)).rotation_difference(Vector(d)).to_euler()
+                sun['mjolnir_sun_from'] = d
+    try:
+        updateBakedMaterials(sun_dir=tuple(suns[0].rotation_euler.to_matrix() @ Vector((0.0, 0.0, 1.0))))
+    except Exception:
+        pass
+
 def setupLighting(context, scene, mapScene=None, force=False):
     """Make the scene look like the game: EEVEE, a sun with shadows, ambient light from the sky's colour,
     ambient occlusion, and the viewport switched to show it. Applied once per scene unless forced."""
@@ -1611,6 +1750,7 @@ def setupLighting(context, scene, mapScene=None, force=False):
         trySet(sc.view_settings, exposure=0.0)
     lightingSun(scene)
     if mapScene is not None and mapScene != scene: lightingSun(mapScene)
+    syncMapSun(scene, mapScene)
     try:
         for area in context.screen.areas:
             if area.type != 'VIEW_3D': continue
@@ -1755,6 +1895,7 @@ def importForgeObjects(context, self=None, createCollections=False):
                     skies = ensureSky(sc)
                     if skies: levelMsg += ", sky added"
                     if setupLighting(context, work, sc): levelMsg += ", game lighting set up"
+                    else: syncMapSun(work, sc)
         except Exception as e:
             traceback.print_exc()
             levelMsg = " (level geometry failed: %s)" % e
