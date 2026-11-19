@@ -85,7 +85,8 @@ also exports every palette model as .obj. Add  --textures tex_folder  to save th
 exports the map's level geometry as .obj (default Blender OBJ import settings work).
     python mjolnir_mapreader.py "C:\path\to\70_boneyard.map" --lighting probe_folder
 prints the map's sky, level shader settings and baked lightmap textures (and saves what it can
-decode). Share that output to help add the game's baked lighting.
+decode). Decoding textures from the command line needs numpy:  pip install numpy
+Share that output to help add the game's baked lighting.
 Run it with no map path while MCC is running a map to test the auto-detection.
 
 Limits

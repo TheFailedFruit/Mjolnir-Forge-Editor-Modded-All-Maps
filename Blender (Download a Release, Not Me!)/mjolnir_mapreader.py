@@ -27,7 +27,7 @@ try:
 except ImportError:  # Blender always has numpy; plain Python may not
     np = None
 
-VERSION = "1.2"
+VERSION = "1.2.1"
 
 class MapReadError(Exception):
     pass
@@ -1236,7 +1236,7 @@ def _shader_methods(cls):
                 tints[arg] = tiling[i]
         return dict(textures=textures, tints=tints, params=params, options=options, group=t.group)
 
-    def read_bitmap(self, tag_index, submap=0, max_size=4096):
+    def read_bitmap(self, tag_index, submap=0, max_size=4096, layer_offset=0):
         """Decode one bitmap (largest mip) to an RGBA uint8 numpy array (rows top to bottom).
         Returns dict(width, height, format, curve, pixels) or raises MapReadError."""
         if np is None: raise MapReadError("numpy is needed to decode textures")
@@ -1251,7 +1251,7 @@ def _shader_methods(cls):
         curve, interleaved = self.u8(d + 17), self.u8(d + 18)
         fmt = BITMAP_FORMATS.get(fmt_code)
         if fmt is None: raise MapReadError(f"unsupported texture format {fmt_code}")
-        if btype not in (0, 3): raise MapReadError("not a 2D texture")  # skip cube maps / 3D
+        if btype not in (0, 3): raise MapReadError("not a 2D texture")  # skip cube maps / 3D (3 = array: layer 0 unless layer_offset)
         if width <= 0 or height <= 0: raise MapReadError("bad size")
 
         n_il, il_addr = self.block(m + BITM_INTERLEAVED)
@@ -1268,9 +1268,10 @@ def _shader_methods(cls):
             need = bw * bh * BLOCK_BYTES[fmt]
         else:
             need = width * height * PIXEL_BYTES[fmt]
-        if len(data) < need: raise MapReadError(f"pixel data too short ({len(data)} < {need})")
-        pixels = decode_pixels(data[:need], width, height, fmt)
-        return dict(width=width, height=height, format=fmt, curve=curve, pixels=pixels)
+        if len(data) < layer_offset + need: raise MapReadError(f"pixel data too short ({len(data)} < {layer_offset + need})")
+        pixels = decode_pixels(data[layer_offset:layer_offset + need], width, height, fmt)
+        return dict(width=width, height=height, format=fmt, curve=curve, pixels=pixels, data_size=len(data), level_size=need,
+                    depth=self.u8(d + 4), mipmaps=self.u8(d + 16))
 
     def bitmap_info(self, tag_index):
         """Describe every image in a bitmap tag without decoding it (used by the lightmap probe)."""
@@ -1655,28 +1656,83 @@ def probe_lighting(c, out_dir):
         except Exception as ex:
             print(f"    shaders failed: {ex}")
         if lm is None: continue
+        if np is None:
+            print("    ** numpy isn't installed for this Python, so lightmap images can't be decoded: run  pip install numpy  and try again **")
+        try:
+            print(f"    brightness {c.f32(lm.meta + 0x18):.3f}, flags 0x{c.u16(lm.meta):04X}")
+        except Exception: pass
         for label, off in (("primary", LBSP_PRIMARY_MAP), ("intensity", LBSP_INTENSITY_MAP)):
             try:
                 t = c.tag_ref(lm.meta + off)
                 print(f"    {label} map: {t.path if t else None} [{t.group if t else ''}]")
                 if t is None or t.group != "bitm": continue
                 imgs = c.bitmap_info(t.index)
-                print(f"      {len(imgs)} images")
-                for im in imgs[:6]: print("      ", im)
-                for im in imgs[:2]:
-                    try:
-                        bm = c.read_bitmap(t.index, im["index"])
-                        fn = os.path.join(out_dir, f"{label}_{bsp.path.split(chr(92))[-1]}_{im['index']}.png")
-                        write_png(bm["pixels"], fn); print(f"      decoded image {im['index']} -> {fn}")
-                    except Exception as ex:
-                        print(f"      image {im['index']}: not decoded ({ex})")
+                for im in imgs[:4]: print("      ", im)
+                if np is None or not imgs: continue
+                im = imgs[0]
+                bm = c.read_bitmap(t.index, 0)
+                print(f"      resource {bm['data_size']} bytes, one image {bm['level_size']} bytes, depth {bm['depth']}, mipmaps {bm['mipmaps']}")
+                fmt = BITMAP_FORMATS.get(c.i16(c.block(t.meta + BITM_BITMAPS)[1] + 8))
+                # array layers: try 'top mip of every layer first' and 'each layer with its mips' orders
+                mip_chain = 0
+                w_, h_ = im["width"], im["height"]
+                for _ in range(max(1, bm["mipmaps"] + 1)):
+                    bw, bh = max(1, (w_ + 3) // 4), max(1, (h_ + 3) // 4)
+                    mip_chain += bw * bh * BLOCK_BYTES.get(fmt, 16) if fmt in BLOCK_BYTES else w_ * h_ * PIXEL_BYTES.get(fmt, 4)
+                    w_, h_ = max(1, w_ // 2), max(1, h_ // 2)
+                layers = max(1, im["depth"]) if im["type"] == 3 else 1
+                for k in range(layers):
+                    for tag_, stride in (("a", bm["level_size"]), ("b", mip_chain)):
+                        if k == 0 and tag_ == "b": continue
+                        try:
+                            px = c.read_bitmap(t.index, 0, layer_offset=k * stride)["pixels"]
+                            fn = os.path.join(out_dir, f"{label}_{bsp.path.split(chr(92))[-1]}_layer{k}{tag_ if k else ''}.png")
+                            write_png(px[::2, ::2], fn)
+                            ch = px.reshape(-1, 4)
+                            print(f"      layer {k}{tag_ if k else ''}: -> {fn}  mean RGBA {tuple(int(v) for v in ch.mean(0))}  min {tuple(int(v) for v in ch.min(0))}  max {tuple(int(v) for v in ch.max(0))}")
+                        except Exception as ex:
+                            print(f"      layer {k}{tag_}: {ex}")
             except Exception as ex:
                 print(f"    {label} map failed: {ex}")
+        # which vertex buffers hold the lightmap texture coordinates
         try:
-            n, addr = c.block(lm.meta + 0xF4)
-            print(f"    per-instance lightmap texcoords: {n} entries")
+            lmm = lm.meta
+            n_a, a_addr = c.block(lmm + 0x48)
+            cl_vb = [c.i16(a_addr + 4 * i) for i in range(n_a)]
+            n_i, i_addr = c.block(lmm + 0xF4)
+            in_vb = [c.i16(i_addr + 2 * i) for i in range(n_i)]
+            n_cl, cl_addr = c.block(bsp.meta + c.bsp_layout()["clusters"])
+            n_in, _ = c.block(bsp.meta + c.bsp_layout()["instances"])
+            print(f"    lightmap uv buffers: {n_a} per-cluster (bsp has {n_cl} clusters) {cl_vb[:12]}, {n_i} per-instance (bsp has {n_in} instances) {in_vb[:12]}")
+            res = c.i32(lmm + LBSP_RESOURCE) & 0xFFFF
+            if res != 0xFFFF:
+                data, entry = c.read_resource(res)
+                vb_info, ib_info = RenderModelReader(c, bsp)._buffer_info(entry)
+                fix = entry["fixups"]
+                print(f"    geometry resource: {len(vb_info)} vertex buffers, {len(ib_info)} index buffers")
+                n_sec, s_addr = c.block(lmm + LBSP_SECTIONS)
+                def show(kind, i, si, vbi):
+                    if si is None or not (0 <= si < n_sec) or not (0 <= vbi < len(vb_info)): 
+                        print(f"      {kind} {i}: section {si}, uv buffer {vbi} (out of range)"); return
+                    o = s_addr + SECTION_SIZE * si
+                    vbs = [c.i16(o + 24 + 2 * k) for k in range(8)]
+                    sc_, sl = vb_info[vbs[0]] if 0 <= vbs[0] < len(vb_info) else (0, 0)
+                    cnt, ln = vb_info[vbi]
+                    raw = data[fix[vbi]:fix[vbi] + min(ln, 32)]
+                    print(f"      {kind} {i}: section {si} buffers {vbs} ({sc_} verts, {sl // max(sc_, 1)} bytes each) -> uv buffer {vbi}: {cnt} verts, "
+                          f"{ln // max(cnt, 1)} bytes each, first bytes {raw.hex()}")
+                for i in range(min(4, n_cl, len(cl_vb))):
+                    show("cluster", i, c.i16(cl_addr + CLUSTER_SIZE * i + CLUSTER_SECTION), cl_vb[i])
+                n_in, in_addr = c.block(bsp.meta + c.bsp_layout()["instances"])
+                try:
+                    entry_i = c.resource_entry(c.i32(bsp.meta + c.bsp_layout()["instances_res"]) & 0xFFFF)
+                    base = c._resource_tables()["fixup_addr"] + entry_i["fixup_offset"] + entry_i["fixups"][-10]
+                    for i in range(min(4, n_in, len(in_vb))):
+                        show("instance", i, c.i16(base + 156 * i + 58), in_vb[i])
+                except Exception as ex:
+                    print(f"      instances: {ex}")
         except Exception as ex:
-            print(f"    per-instance texcoords failed: {ex}")
+            print(f"    lightmap uv probe failed: {type(ex).__name__}: {ex}")
 
 def main(argv):
     import argparse

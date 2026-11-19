@@ -774,7 +774,7 @@ def bitmapImage(bitmap_index, kind='color'):
     return img
 
 BASE_USAGES = ('base_map', 'change_color_map', 'foam_texture', 'alpha_mask_map', 'detail_map')
-MATERIAL_VERSION = 2  # 2: detail maps, terrain blending, specular/roughness. Older materials are rebuilt.
+MATERIAL_VERSION = 3  # 2: detail maps, terrain blending, specular/roughness. 3: values tuned on Boneyard, self-illum modes. Older materials are rebuilt.
 DETAIL_MULTIPLIER = 4.59479  # Halo's detail scale (2.0 in gamma space) applied to linear colours
 
 def bsdfInput(bsdf, *names):
@@ -864,12 +864,22 @@ def texturedMaterial(mat, shader_index, log=print):
         color = base.outputs['Color']
         albedo = opts.get('albedo', 'default')
         d1 = image_node('detail_map' + suffix, 'color')
-        d2 = image_node('detail_map2' + suffix, 'color') if 'detail_map2' + suffix in tex else None
-        if d1 is not None and d2 is not None and 'blend' in albedo:
-            det = mix(base.outputs['Alpha'], d1.outputs['Color'], d2.outputs['Color'])
+        d2 = image_node('detail_map2' + suffix, 'color')
+        d3 = image_node('detail_map3' + suffix, 'color')
+        ov = image_node('detail_map_overlay' + suffix, 'color')
+        a = base.outputs['Alpha']
+        if d1 is not None and d2 is not None and d3 is not None and 'three_detail_blend' in albedo:
+            # base alpha 0..0.5 blends detail 1->2, 0.5..1 blends 2->3
+            f1 = math('MINIMUM', math('MULTIPLY', a, 2.0), 1.0)
+            f2 = math('MAXIMUM', math('SUBTRACT', math('MULTIPLY', a, 2.0), 1.0), 0.0)
+            det = mix(f2, mix(f1, d1.outputs['Color'], d2.outputs['Color']), d3.outputs['Color'])
             color = vmath('SCALE', vmath('MULTIPLY', color, det), DETAIL_MULTIPLIER)
+        elif d1 is not None and d2 is not None and ('blend' in albedo or 'overlay' in albedo):
+            det = mix(a, d1.outputs['Color'], d2.outputs['Color'])
+            color = vmath('SCALE', vmath('MULTIPLY', color, det), DETAIL_MULTIPLIER)
+            if ov is not None: color = vmath('SCALE', vmath('MULTIPLY', color, ov.outputs['Color']), DETAIL_MULTIPLIER)
         else:
-            for d in (d1, d2, image_node('detail_map_overlay' + suffix, 'color')):
+            for d in (d1, d2, ov):
                 if d is not None: color = vmath('SCALE', vmath('MULTIPLY', color, d.outputs['Color']), DETAIL_MULTIPLIER)
         return color
 
@@ -920,6 +930,8 @@ def texturedMaterial(mat, shader_index, log=print):
     if base is not None:
         if tint_rgb and tint_rgb[:3] != (1.0, 1.0, 1.0):
             color = vmath('MULTIPLY', color, tint_rgb)
+        g = scalar('global_albedo_tint', 1.0)
+        if 0.0 < g < 1.0: color = vmath('SCALE', color, g)
         links.new(color, bsdf.inputs['Base Color'])
         if alpha_test or blend in ('alpha_blend', 'pre_multiplied_alpha'):
             links.new(base.outputs['Alpha'], bsdf.inputs['Alpha'])
@@ -938,13 +950,24 @@ def texturedMaterial(mat, shader_index, log=print):
     model = opts.get('material_model', opts.get('specular', ''))
     spec_in = bsdfInput(bsdf, 'Specular IOR Level', 'Specular')
     rough_in = bsdfInput(bsdf, 'Roughness')
-    if 'diffuse_only' in model or model in ('none', 'off'):
+    if blend_map is not None:
+        lit = [k for k in layers if 'specular' in opts.get('material_%d' % k, '')]
+        model = 'cook_torrance' if lit else 'diffuse_only'
+    if 'diffuse_only' in model or model in ('none', 'off', ''):
         level, rough = 0.0, 1.0
     else:
-        coef = scalar('specular_coefficient', scalar('specular_coefficient_m_0', 0.1 if blend_map is not None else 0.2))
-        level = max(0.0, min(1.0, coef * 2.5))
-        rough = max(0.05, min(1.0, scalar('roughness', scalar('roughness_m_0', 0.4))))
-        if blend_map is not None: level *= 0.5
+        # Halo keeps specular_coefficient near 1 and scales highlights with the *_contribution values
+        coef = scalar('specular_coefficient', scalar('specular_coefficient_m_0', 1.0))
+        contrib = max(scalar('analytical_specular_contribution', 0.0), scalar('area_specular_contribution', 0.0),
+                      scalar('analytical_specular_contribution_m_0', 0.0))
+        strength = coef * (contrib if contrib > 0 else 0.15)
+        level = max(0.0, min(0.8, strength * 1.5))
+        if 'phong' in model:  # specular power -> roughness
+            power = scalar('normal_specular_power', 10.0)
+            rough = sqrt(2.0 / (max(power, 0.0) + 2.0))
+        else:  # Halo roughness behaves like a squared (Beckmann-style) value
+            rough = sqrt(max(scalar('roughness', scalar('roughness_m_0', 0.16)), scalar('analytical_roughness', 0.0) * 0.5))
+        rough = max(0.25, min(1.0, rough))
     if spec_in is not None:
         mask_opt = opts.get('specular_mask', '')
         if level > 0 and base is not None and blend_map is None and 'from_diffuse' in mask_opt and not alpha_test:
@@ -957,9 +980,16 @@ def texturedMaterial(mat, shader_index, log=print):
             spec_in.default_value = level
     if rough_in is not None: rough_in.default_value = rough
 
-    si = image_node('self_illum_map', 'color')
+    si_mode = opts.get('self_illumination', 'off')
+    si = image_node('self_illum_map', 'color') if si_mode not in ('off', 'plasma') else None
+    emit = None
     if si is not None:
         emit = si.outputs['Color']
+        sd = image_node('self_illum_detail_map', 'color') if 'detail' in si_mode else None
+        if sd is not None: emit = vmath('SCALE', vmath('MULTIPLY', emit, sd.outputs['Color']), DETAIL_MULTIPLIER)
+    elif si_mode == 'from_diffuse' and bsdf.inputs['Base Color'].links:
+        emit = bsdf.inputs['Base Color'].links[0].from_socket
+    if emit is not None:
         st = tints.get('self_illum_color')
         if st and tuple(st[:3]) != (1.0, 1.0, 1.0): emit = vmath('MULTIPLY', emit, tuple(st))
         e_col = bsdfInput(bsdf, 'Emission Color', 'Emission')
@@ -971,7 +1001,9 @@ def texturedMaterial(mat, shader_index, log=print):
     if blend in ('additive', 'multiply', 'double_multiply'):
         # glows / light cards: show the colour as light, let everything else through
         emit = nodes.new('ShaderNodeEmission'); emit.location = (300, 300)
-        if bsdf.inputs['Base Color'].links: links.new(bsdf.inputs['Base Color'].links[0].from_socket, emit.inputs['Color'])
+        e_col = bsdfInput(bsdf, 'Emission Color', 'Emission')
+        if e_col is not None and e_col.links: links.new(e_col.links[0].from_socket, emit.inputs['Color'])  # self-illum glow
+        elif bsdf.inputs['Base Color'].links: links.new(bsdf.inputs['Base Color'].links[0].from_socket, emit.inputs['Color'])
         else: emit.inputs['Color'].default_value = bsdf.inputs['Base Color'].default_value
         tr = nodes.new('ShaderNodeBsdfTransparent'); tr.location = (300, 450)
         add = nodes.new('ShaderNodeAddShader'); add.location = (500, 300)
@@ -1209,29 +1241,47 @@ def ensureMapScene(context, log=print):
     return sc, built
 
 # ---- sky and lighting ------------------------------------------------------------------------
-SKY_VERSION = 1
+SKY_VERSION = 2  # 2: sky uses self-illumination (Reach skies are mostly self-lit)
 LIGHTING_VERSION = 1
 SKY_DEFAULT_COLOR = (0.42, 0.55, 0.75)
 
 def skyMaterial(mat):
-    """Unlit copy of a material for the sky: its colour is shown as-is, like the game draws skies."""
+    """Unlit copy of a material for the sky: shows its self-illumination (or base colour) as-is,
+    like the game draws skies."""
     key = 'sky|' + mat.name
-    for m in bpy.data.materials:
-        if m.get('mjolnir_sky_of') == key: return m
+    for m in list(bpy.data.materials):
+        if m.get('mjolnir_sky_of') == key:
+            if m.get('mjolnir_sky_version') == SKY_VERSION: return m
+            m.name = m.name + " old"   # left for Blender to purge once unused
+            del m['mjolnir_sky_of']
     sky = mat.copy(); sky.name = mat.name + " (sky)"
     sky['mjolnir_sky_of'] = key
+    sky['mjolnir_sky_version'] = SKY_VERSION
     if sky.node_tree is None: return sky
     nodes, links = sky.node_tree.nodes, sky.node_tree.links
     bsdf = next((n for n in nodes if n.type == 'BSDF_PRINCIPLED'), None)
     out = next((n for n in nodes if n.type == 'OUTPUT_MATERIAL'), None)
     if bsdf is None or out is None: return sky
-    emit = nodes.new('ShaderNodeEmission'); emit.location = (bsdf.location.x, bsdf.location.y - 500)
-    src = bsdf.inputs['Base Color'].links
-    if src: links.new(src[0].from_socket, emit.inputs['Color'])
-    else: emit.inputs['Color'].default_value = bsdf.inputs['Base Color'].default_value
     surf = out.inputs['Surface']
-    if surf.links and surf.links[0].from_node.type == 'ADD_SHADER': pass  # additive layers (clouds/glow) stay as they are
-    else: links.new(emit.outputs[0], surf)
+    if surf.links and surf.links[0].from_node.type == 'ADD_SHADER': return sky  # additive layers (clouds/glow) already unlit
+    emit = nodes.new('ShaderNodeEmission'); emit.location = (bsdf.location.x, bsdf.location.y - 500)
+    e_col = bsdfInput(bsdf, 'Emission Color', 'Emission')
+    e_str = bsdfInput(bsdf, 'Emission Strength')
+    if e_col is not None and e_col.links:
+        links.new(e_col.links[0].from_socket, emit.inputs['Color'])
+        emit.inputs['Strength'].default_value = e_str.default_value if e_str is not None else 1.0
+    elif bsdf.inputs['Base Color'].links:
+        links.new(bsdf.inputs['Base Color'].links[0].from_socket, emit.inputs['Color'])
+    else:
+        emit.inputs['Color'].default_value = bsdf.inputs['Base Color'].default_value
+    shader = emit.outputs[0]
+    if bsdf.inputs['Alpha'].links:  # alpha-blended layers (smoke, mountain fades)
+        tr = nodes.new('ShaderNodeBsdfTransparent'); tr.location = (emit.location.x, emit.location.y - 150)
+        mx = nodes.new('ShaderNodeMixShader'); mx.location = (emit.location.x + 200, emit.location.y)
+        links.new(bsdf.inputs['Alpha'].links[0].from_socket, mx.inputs[0])
+        links.new(tr.outputs[0], mx.inputs[1]); links.new(emit.outputs[0], mx.inputs[2])
+        shader = mx.outputs[0]
+    links.new(shader, surf)
     return sky
 
 def imageAverage(img):
@@ -1253,7 +1303,7 @@ def skyColor(objs):
             m = slot.material
             if m is None or m.node_tree is None: continue
             for n in m.node_tree.nodes:
-                if n.type == 'TEX_IMAGE' and n.image is not None and n.label in ('base_map', 'detail_map', ''):
+                if n.type == 'TEX_IMAGE' and n.image is not None and n.label in ('base_map', 'self_illum_map', ''):
                     c = imageAverage(n.image)
                     if c: cols.append(c)
     if not cols: return None
