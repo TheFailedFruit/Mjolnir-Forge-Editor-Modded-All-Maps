@@ -33,7 +33,7 @@ When you press File > Import > Forge Objects, Mjolnir now:
      tweaks are kept; the sun button next to the setting re-applies it (and rebuilds the sky).
      Materials now use more of Halo's shader: detail maps, terrain blending of up to four layers
      (with their normal maps), and specular strength / roughness from the shader's own values.
-     Baked Lighting (experimental, off by default for now): the level is lit with the map's own baked lightmaps
+     Baked Lighting (experimental, on by default): the level is lit with the map's own baked lightmaps
      read from the .map, like the game. The importer first checks that the lightmap lines up with the
      geometry and falls back to sun lighting if it doesn't (the import log says which). Forge objects
      are lit by the sun; rotate the "Sun" object to match the map's shadows. The exposure is set
@@ -69,7 +69,7 @@ Settings  (Properties editor > Scene tab > Forge Scene > Map Palette)
   Build Map Scene          on by default (off = no map geometry is built or switched)
 Lighting  (same panel, "Lighting" box)
   Game Lighting            on by default: sky + EEVEE lighting on import
-  Baked Lighting           off by default for now: level lit by the map's baked lightmaps (experimental)
+  Baked Lighting           on by default: level lit by the map's baked lightmaps (experimental)
   Baked Brightness         1 = automatic exposure
   Set Up Game Lighting     applies the above now (rebuilds the level if Baked Lighting was switched)
   Render Thumbnails        on by default (previews of newly extracted models for the search)

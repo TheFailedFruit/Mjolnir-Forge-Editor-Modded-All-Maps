@@ -1153,7 +1153,21 @@ def buildLevel(scene, title, log=print):
         for c in level['clusters']:
             sec = level['sections'][c]
             m = lit(sec, sec.get('lightmap_uvs'))
-            groups.setdefault(m is not None, []).append(m or sec)
+            if m is None:
+                plain = dict(sec); plain.pop('lightmap_uvs', None)
+                groups.setdefault(False, []).append(plain); continue
+            raw = np.asarray(sec['lightmap_uvs'])
+            has = (raw >= 0).all(1)
+            if has.all():
+                groups.setdefault(True, []).append(m); continue
+            # a few vertices have no lightmap coordinates: their triangles keep sun lighting
+            tri_ok = [all(has[i] for i in t) for t in sec['triangles']]
+            for flag in (True, False):
+                part = dict(m if flag else sec)
+                part['triangles'] = [t for t, k in zip(sec['triangles'], tri_ok) if k == flag]
+                part['tri_materials'] = [x for x, k in zip(sec['tri_materials'], tri_ok) if k == flag]
+                if not flag: part.pop('lightmap_uvs', None)
+                if part['triangles']: groups.setdefault(flag, []).append(part)
         for is_lit, meshes in groups.items():
             nm = level['name'] + (" clusters (baked light)" if is_lit else " clusters")
             me = buildModelMesh(nm, dict(meshes=meshes, shader_tags=tags))
@@ -1178,7 +1192,7 @@ def buildLevel(scene, title, log=print):
         log("Level %s: %d clusters, %d instances in %.1fs" % (level['name'], len(level['clusters']), len(level['instances']), time.time() - t0))
     return count
 
-LEVEL_VERSION = 4  # 2: large BSPs (>4096 buffers) + checked index decoding. 3: baked lightmaps. 4: lightmap exposure. Older builds are rebuilt.
+LEVEL_VERSION = 5  # 5: lightmap orientation fixed. 2: large BSPs (>4096 buffers) + checked index decoding. 3: baked lightmaps. 4: lightmap exposure. Older builds are rebuilt.
 
 def bakedLightmap(level, log=print):
     """The level's baked lighting, if it can be used: (image, brightness, uv converter) or None.
@@ -1190,10 +1204,10 @@ def bakedLightmap(level, log=print):
     try:
         px = cache.read_bitmap(info['bitmap'])['pixels']
         meshes = [level['sections'][c] for c in level['clusters'] if level['sections'][c].get('lightmap_uvs') is not None]
-        meshes += [dict(lightmap_uvs=i[4], triangles=level['sections'][i[1]]['triangles']) for i in level['instances'] if i[4] is not None]
+        meshes += [dict(lightmap_uvs=i[4], triangles=level['sections'][i[1]]['triangles'], positions=level['sections'][i[1]]['positions']) for i in level['instances'] if i[4] is not None]
         if not meshes: return None
         o = mapreader.lightmap_orientation(px, meshes)
-        log("Lightmap check %s: %s" % (level['name'], {k: o.get(k) for k in ('ok', 'score', 'baseline', 'blank', 'flip_u', 'v_from_top', 'all')}))
+        log("Lightmap check %s: %s" % (level['name'], {k: o.get(k) for k in ('ok', 'blank', 'flip_u', 'v_from_top', 'triangles', 'all')}))
         if not o['ok']:
             log("Baked lighting for %s didn't line up with the geometry; using sun lighting instead" % level['name'])
             return None
@@ -2651,7 +2665,7 @@ class ForgeSceneProps(bpy.types.PropertyGroup):
             if n is not None: n.inputs['Scale'].default_value = m.get('mjolnir_lightmap_brightness', 1.0) * self.bakedBrightness
     bakedBrightness: FloatProperty(name="Baked Brightness", default=1.0, min=0.0, soft_max=4.0,
         description="Brightness of the baked lighting (1 = automatic exposure)", update=UpdateBakedBrightness)
-    bakedLighting: BoolProperty(name="Baked Lighting", default=False,
+    bakedLighting: BoolProperty(name="Baked Lighting", default=True,
         description="Light the map's level geometry with its baked lightmaps from the .map, like the game (experimental). Off = sun lighting")
     gameLighting: BoolProperty(name="Game Lighting", default=True,
         description="On import, add the map's sky and set up EEVEE lighting (sun, sky-coloured ambient light, shadows, AO) so it looks closer to the game")

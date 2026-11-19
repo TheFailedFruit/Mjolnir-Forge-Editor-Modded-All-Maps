@@ -797,43 +797,40 @@ def transform_mesh(mesh, scale, m):
     return mesh
 
 def lightmap_orientation(pixels, meshes):
-    """Work out how lightmap UVs map onto the lightmap image: the right way makes neighbouring vertices
-    sample similar light. pixels: RGBA uint8, rows top to bottom. meshes: dicts with 'lightmap_uvs' (N x 2,
-    -1 = none) and 'triangles'. Returns dict(flip_u, v_from_top, score, baseline, ok)."""
+    """Work out how lightmap UVs map onto the lightmap image. The right way puts every triangle inside a
+    used part of the atlas; the wrong ways land many triangles in its unused (black) gaps.
+    pixels: RGBA uint8, rows top to bottom. meshes: dicts with 'lightmap_uvs' (N x 2, -1 = none),
+    'triangles' and 'positions'. Returns dict(flip_u, v_from_top, blank, ok, all)."""
     H, W = pixels.shape[:2]
-    img = pixels[..., :3].astype(np.float32) / 255.0
-    edges = []
+    used = pixels[..., :3].astype(np.int32).sum(2) > 5
+    C, A = [], []
     for m in meshes:
-        uv = m.get("lightmap_uvs")
+        uv = np.asarray(m.get("lightmap_uvs"), np.float64) if m.get("lightmap_uvs") is not None else None
         if uv is None or not m["triangles"]: continue
         t = np.asarray(m["triangles"], np.int64)
-        e = np.concatenate([t[:, [0, 1]], t[:, [1, 2]], t[:, [2, 0]]])
-        good = (uv[e[:, 0], 0] >= 0) & (uv[e[:, 1], 0] >= 0)
-        a, b = uv[e[good, 0]], uv[e[good, 1]]
-        # short edges only: long ones may cross chart borders
-        short = np.abs(a - b).max(1) < 8.0 / W
-        edges.append((a[short], b[short]))
-    if not edges: return dict(ok=False, score=None, baseline=None, flip_u=False, v_from_top=True)
-    A = np.concatenate([e[0] for e in edges]); B = np.concatenate([e[1] for e in edges])
-    if len(A) > 400000:
-        sel = np.random.default_rng(1).choice(len(A), 400000, replace=False); A, B = A[sel], B[sel]
-    def sample(uv, flip_u, v_from_top):
-        u = 1.0 - uv[:, 0] if flip_u else uv[:, 0]
-        v = uv[:, 1] if v_from_top else 1.0 - uv[:, 1]
+        t = t[(t < len(uv)).all(1)]
+        t = t[(uv[t] >= 0).all(2).all(1)]
+        if not len(t): continue
+        C.append(uv[t].mean(1))
+        if m.get("positions") is not None:
+            P = np.asarray(m["positions"], np.float64)
+            A.append(np.linalg.norm(np.cross(P[t[:, 1]] - P[t[:, 0]], P[t[:, 2]] - P[t[:, 0]]), axis=1) + 1e-6)
+        else:
+            A.append(np.ones(len(t)))
+    if not C: return dict(ok=False, blank=None, flip_u=False, v_from_top=True, all=[])
+    C = np.concatenate(C); A = np.concatenate(A)
+    def blank(fu, vt):
+        u = 1.0 - C[:, 0] if fu else C[:, 0]
+        v = C[:, 1] if vt else 1.0 - C[:, 1]
         x = np.clip((u * W).astype(np.int64), 0, W - 1); y = np.clip((v * H).astype(np.int64), 0, H - 1)
-        return img[y, x]
-    def score(fu, vt):
-        sa = sample(A, fu, vt)
-        diff = float(np.abs(sa - sample(B, fu, vt)).sum(1).mean())
-        return diff + float((sa.sum(1) < 0.02).mean())   # landing on unused (black) atlas space counts against
-    results = sorted((score(fu, vt), fu, vt) for fu in (False, True) for vt in (True, False))
-    rng = np.random.default_rng(2)
-    perm = B[rng.permutation(len(B))]
-    baseline = float(np.abs(sample(A, False, True) - sample(perm, False, True)).sum(1).mean())
-    best, fu, vt = results[0]
-    blank = float((sample(A, fu, vt).sum(1) < 0.02).mean())
-    return dict(ok=bool(best < 0.5 * baseline and blank < 0.3), score=best, baseline=baseline, flip_u=fu, v_from_top=vt,
-                blank=blank, all=[(round(r[0], 4), r[1], r[2]) for r in results], edges=len(A))
+        return float(np.average(~used[y, x], weights=A))
+    # identity first, so it wins ties
+    res = sorted(((blank(fu, vt), i, fu, vt) for i, (fu, vt) in enumerate(((False, True), (True, True), (False, False), (True, False)))))
+    best, _, fu, vt = res[0]
+    others = sorted(r[0] for r in res[1:])
+    ok = best < 0.05 and best < 0.5 * others[len(others) // 2]
+    return dict(ok=bool(ok), blank=round(best, 4), flip_u=fu, v_from_top=vt, triangles=len(C),
+                all=[(round(r[0], 4), r[2], r[3]) for r in res])
 
 def write_png(pixels, path):
     """Write an RGBA uint8 (H,W,4) array as PNG with the standard library only."""
@@ -1864,7 +1861,7 @@ def probe_lighting(c, out_dir):
                 if info:
                     px = c.read_bitmap(info["bitmap"])["pixels"]
                     lit = [level["sections"][si] for si in level["clusters"] if "lightmap_uvs" in level["sections"][si]]
-                    lit += [dict(lightmap_uvs=i[4], triangles=level["sections"][i[1]]["triangles"]) for i in level["instances"] if i[4] is not None]
+                    lit += [dict(lightmap_uvs=i[4], triangles=level["sections"][i[1]]["triangles"], positions=level["sections"][i[1]]["positions"]) for i in level["instances"] if i[4] is not None]
                     o = lightmap_orientation(px, lit)
                     print(f"    lightmap check: {len(lit)} lightmapped meshes ({level['report'].get('lightmapped_instances')} instances), "
                           f"clusters (section, uv count, vertex count) {level['report'].get('lightmap_clusters', [])[:6]}")
