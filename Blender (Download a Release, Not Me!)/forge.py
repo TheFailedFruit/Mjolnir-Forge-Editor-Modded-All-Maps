@@ -3018,6 +3018,106 @@ reg_classes = [
 reg_objMenus = [convertForgeMenuItem, setupArrayMenuItem, rotateModelMenuItem]
 reg_addMenus = [addForgeObjectMenuItem]
 
+# ---- copy / paste between .blend files ---------------------------------------------------------
+# Pasting forge objects into another forge.blend brings a duplicate of every model collection they use
+# ("Bridge, Large.001") and Blender drops those duplicates' parts loose in the scene at the origin.
+# Afterwards, point the pasted objects back at this file's own models and remove the duplicates.
+DUP_SUFFIX = __import__('re').compile(r'^(.*)\.(\d{3,})$')
+
+def isModelCollection(c):
+    if c is None: return False
+    if c.get('mjolnir_type_id') is not None: return True
+    pal = bpy.data.collections.get(mapPalette)
+    if pal is not None and (c == pal or c.name in {x.name for x in pal.children_recursive}): return True
+    props = bpy.data.scenes.get(propSceneName)
+    return props is not None and c.name in {x.name for x in props.collection.children_recursive}
+
+def originalModel(c):
+    """This file's own model collection that a pasted duplicate stands for, or None."""
+    m = DUP_SUFFIX.match(c.name)
+    if m:
+        base = bpy.data.collections.get(m.group(1))
+        if base is not None and base != c and isModelCollection(base) and base.library is None: return base
+    tid = c.get('mjolnir_type_id')
+    if tid is not None:
+        for other in bpy.data.collections:
+            if other != c and other.get('mjolnir_type_id') == tid and other.get('mjolnir_map') == c.get('mjolnir_map') and not DUP_SUFFIX.match(other.name):
+                return other
+    return None
+
+def removeCollectionDeep(c):
+    meshes, mats = set(), set()
+    for ob in list(c.all_objects):
+        masters = {sc.collection for sc in bpy.data.scenes}
+        if ob.get('isForgeObject') or any(uc != c and uc not in c.children_recursive and uc not in masters and isModelCollection(uc)
+                                         for uc in ob.users_collection): continue   # also part of another model
+        if ob.type == 'MESH':
+            meshes.add(ob.data); mats.update(m for m in ob.data.materials if m is not None)
+        bpy.data.objects.remove(ob, do_unlink=True)
+    for ch in list(c.children_recursive):
+        try: bpy.data.collections.remove(ch)
+        except Exception: pass
+    bpy.data.collections.remove(c)
+    for me in meshes:
+        if me.users == 0: bpy.data.meshes.remove(me)
+    for m in mats:
+        if m.users == 0:
+            imgs = [n.image for n in (m.node_tree.nodes if m.node_tree else []) if n.type == 'TEX_IMAGE' and n.image]
+            bpy.data.materials.remove(m)
+            for img in imgs:
+                if img.users == 0: bpy.data.images.remove(img)
+
+def fixPastedObjects():
+    """Repair forge objects pasted from another .blend. Returns how many duplicates were merged."""
+    instanced = {}
+    for ob in bpy.data.objects:
+        if ob.instance_type == 'COLLECTION' and ob.instance_collection is not None:
+            instanced.setdefault(ob.instance_collection.name, []).append(ob)
+    merged = 0
+    for c in list(bpy.data.collections):
+        if c.library is not None or c.name not in instanced and not DUP_SUFFIX.match(c.name): continue
+        base = originalModel(c)
+        if base is not None and (c.name in instanced or isModelCollection(c) or c.get('mjolnir_type_id') is not None):
+            for ob in instanced.get(c.name, []): ob.instance_collection = base
+            removeCollectionDeep(c)
+            merged += 1
+            continue
+        users = instanced.get(c.name, [])
+        if base is None and any(o.get('isForgeObject') for o in users):
+            # a model this file doesn't have (e.g. extracted on another map): keep it, but out of the scene
+            for sc in bpy.data.scenes:
+                if sc.name == propSceneName: continue
+                if c.name in sc.collection.children: sc.collection.children.unlink(c)
+                for ob in c.all_objects:
+                    for uc in list(ob.users_collection):
+                        if uc == sc.collection or (uc != c and uc not in c.children_recursive and uc.name in {x.name for x in sc.collection.children_recursive}):
+                            uc.objects.unlink(ob)
+            root = extractedRoot()
+            if c != root and c.name not in root.children and c.name not in {x.name for x in root.children_recursive}:
+                try: root.children.link(c)
+                except Exception: pass
+    return merged
+
+_paste_state = {'count': -1, 'pending': False}
+
+def _pasteCheckTimer():
+    _paste_state['pending'] = False
+    try:
+        n = fixPastedObjects()
+        if n: print("Mjolnir: merged %d pasted model duplicates into this file's models" % n)
+    except Exception as e:
+        print("Mjolnir: paste cleanup failed: %s" % e)
+    _paste_state['count'] = len(bpy.data.collections)
+    return None
+
+def _pasteWatcher(scene, depsgraph=None):
+    n = len(bpy.data.collections)
+    if n > _paste_state['count'] >= 0 and not _paste_state['pending']:
+        _paste_state['pending'] = True
+        bpy.app.timers.register(_pasteCheckTimer, first_interval=0.05)
+    else:
+        _paste_state['count'] = n
+
 def registerDrawEvent(event, item):
     id = event.bl_rna.name
     handles = persist_vars.get(id, [])
@@ -3051,6 +3151,10 @@ def register():
     bpy.types.WindowManager.forge_search = bpy.props.PointerProperty(type=ForgeSearchState)
     
     persist_vars['forgeObjectsOverlay_handle'] = bpy.types.SpaceView3D.draw_handler_add(draw_forgeObjectOverlay, (), 'WINDOW', 'POST_PIXEL')
+    for h in list(bpy.app.handlers.depsgraph_update_post):
+        if getattr(h, '__name__', '') == '_pasteWatcher': bpy.app.handlers.depsgraph_update_post.remove(h)
+    _paste_state['count'] = len(bpy.data.collections)
+    bpy.app.handlers.depsgraph_update_post.append(_pasteWatcher)
     if persist_vars.get('gtIndexToLabel', None) == None: initGtLabels()
     initInvGtLabels()
 
@@ -3089,6 +3193,8 @@ def unregister():
     removeDrawEvents(bpy.types.TOPBAR_MT_file_import)
     removeDrawEvents(bpy.types.TOPBAR_MT_file_export)
     bpy.types.SpaceView3D.draw_handler_remove(persist_vars['forgeObjectsOverlay_handle'], 'WINDOW')
+    for h in list(bpy.app.handlers.depsgraph_update_post):
+        if getattr(h, '__name__', '') == '_pasteWatcher': bpy.app.handlers.depsgraph_update_post.remove(h)
 
 
 try: unregister()

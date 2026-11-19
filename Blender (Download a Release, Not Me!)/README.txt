@@ -40,6 +40,11 @@ When you press File > Import > Forge Objects, Mjolnir now:
      that the lightmap lines up with the geometry and falls back to plain sun lighting if it doesn't.
      Rotate the "Sun" and press Set Up Game Lighting to change the sun direction yourself.
 
+Copying forge objects between .blend files (Ctrl+C in one Blender, Ctrl+V in another) works: pasted
+objects are pointed back at the receiving file's own models, and the duplicate models Blender brings
+along (which used to show up as loose parts at the world origin) are removed automatically. Models
+the receiving file doesn't have (e.g. extracted on another map) are kept, under Extracted Models.
+
 Models extracted by an earlier version of this patch are rebuilt automatically on the next import.
 
 If a model comes in facing the wrong way (can happen with ported/modded models), select one copy and
