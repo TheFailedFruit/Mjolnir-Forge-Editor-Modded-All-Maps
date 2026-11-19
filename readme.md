@@ -5,6 +5,7 @@ This fork reads what it needs straight from the `.map` file MCC has loaded, so *
 - **Models extracted automatically.** Objects with no mesh in `forge.blend` (vehicles, modded props) are built from the map's render models, including variant attachments and vehicle weapons. They also appear under Add > Forge Object.
 - **Textures.** Extracted models and levels get materials from the map's shaders: base map with tint, normal map, self-illumination, alpha. Images are packed into the .blend.
 - **Every map's level.** The first import on a map builds its textured level geometry into its own scene; your working scene shows it as the "Map" backdrop, the same way Forge World works. Outdated builds are rebuilt automatically.
+- **Search with previews.** Add > Forge Object... opens a searchable list with a large thumbnail of the selected item. Stock items ship with thumbnails; extracted models get one rendered automatically.
 - **Fixes:** Anvil scale convention now really defaults to 47X; scaled objects no longer import at 100% when something is selected; Anvil yellow-team and scale-zone rules; readable errors when ForgeBridge.dll fails.
 
 Settings are under Properties > Scene > Forge Scene > Map Palette. If a model faces the wrong way (some ported models), right-click > **Rotate Model 90°** fixes every copy.

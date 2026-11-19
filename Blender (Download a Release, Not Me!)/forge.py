@@ -1158,6 +1158,7 @@ def ensureModelCollection(context, itemName, type_id, log=print):
     coll['mjolnir_map'] = os.path.basename(palette['path'] or "")
     coll['mjolnir_placeholder'] = placeholder
     coll['mjolnir_model_version'] = MODEL_VERSION
+    coll['mjolnir_thumb'] = 0  # (re)render its thumbnail
     return coll
 
 def createForgeObject(context, itemName, i=None, data=None):
@@ -1225,6 +1226,7 @@ def importForgeObjects(context, self=None, createCollections=False):
     upgraded = upgradeMaterials() if usingPalette else 0
     extract = usingPalette and context.scene.forge.extractModels
     extracted = 0
+    newColls = []
     c = forge.GetObjectCount()
     gt_c = forge.GetGtLabelCount()
     print("Map: %s, %d Objects, %d Gametype Labels"%(forge.GetMapName(), c, gt_c))
@@ -1244,7 +1246,11 @@ def importForgeObjects(context, self=None, createCollections=False):
         if extract:
             coll = bpy.data.collections.get(itemName)
             outdated = coll is not None and coll.get('mjolnir_type_id') is not None and coll.get('mjolnir_model_version', 1) < MODEL_VERSION
-            if (coll is None or outdated) and ensureModelCollection(context, itemName, typeId) is not None: extracted += 1
+            if coll is None or outdated:
+                made = ensureModelCollection(context, itemName, typeId)
+                if made is not None:
+                    extracted += 1
+                    newColls.append(made)
 
         if createCollections and itemName not in bpy.data.collections:
             collection = bpy.data.collections.new(itemName)
@@ -1265,6 +1271,7 @@ def importForgeObjects(context, self=None, createCollections=False):
             cam.rotation_euler = Euler((radians(90),0,0))
             lockObject(cam, True, True, True)
     
+    thumbs = thumbnailNewModels(context, newColls)
     msg = "Imported %d objects in %.3fs"%(c,time.time() - t0)
     if usingPalette: msg += ", palette from %s" % os.path.basename(palette['path'])
     elif palette['error']: msg += " (built-in palette: %s)" % palette['error']
@@ -1840,6 +1847,191 @@ def getCollectionEnums(collection, list):
         else: getCollectionEnums(coll, list)
     return list
 def genObjectTypesEnum(self, context): return getCollectionEnums(bpy.data.collections[mapPalette], [])
+# ---- palette thumbnails: rendered once per palette item, stored as the collection's preview in the .blend ----
+THUMB_SIZE, THUMB_ICON = 256, 32
+THUMB_VERSION = 1
+
+def hasThumbnail(coll):
+    p = coll.preview
+    return p is not None and p.is_image_custom and coll.get('mjolnir_thumb', 0) >= THUMB_VERSION
+
+def paletteItems():
+    """[(collection, category path)] for every placeable palette item, in menu order."""
+    out = []
+    def walk(c, path):
+        for ch in c.children:
+            if len(ch.objects) > 0: out.append((ch, path))
+            elif len(ch.children) > 0: walk(ch, path + [ch.name])
+    pal = bpy.data.collections.get(mapPalette)
+    if pal is not None: walk(pal, [])
+    return out
+
+def collectionBounds(coll):
+    pts = []
+    for ob in coll.all_objects:
+        if ob.type == 'MESH':
+            pts += [ob.matrix_world @ Vector(c) for c in ob.bound_box]
+    if not pts: return None
+    lo = Vector([min(p[i] for p in pts) for i in range(3)])
+    hi = Vector([max(p[i] for p in pts) for i in range(3)])
+    return lo, hi
+
+def renderThumbnails(colls, engine=None, log=print):
+    """Render a thumbnail for each collection into its preview. Returns how many were made."""
+    import tempfile
+    colls = [c for c in colls if c is not None and collectionBounds(c) is not None]
+    if not colls: return 0
+    sc = bpy.data.scenes.new("Mjolnir Thumbnails")
+    made, tmpdir = 0, tempfile.mkdtemp(prefix="mjolnir_thumbs_")
+    cam_data = bpy.data.cameras.new("Mjolnir Thumb Camera")
+    sun_data = bpy.data.lights.new("Mjolnir Thumb Sun", 'SUN')
+    cam = bpy.data.objects.new("Mjolnir Thumb Camera", cam_data)
+    sun = bpy.data.objects.new("Mjolnir Thumb Sun", sun_data)
+    world = bpy.data.worlds.new("Mjolnir Thumb World")
+    try:
+        r = sc.render
+        for eng in ([engine] if engine else []) + ['BLENDER_EEVEE_NEXT', 'BLENDER_EEVEE', 'CYCLES']:
+            try: r.engine = eng; break
+            except TypeError: continue
+        if r.engine == 'CYCLES':
+            sc.cycles.samples = 16
+            try: sc.cycles.use_denoising = True
+            except Exception: pass
+        else:
+            try: sc.eevee.taa_render_samples = 16
+            except Exception: pass
+        r.resolution_x = r.resolution_y = THUMB_SIZE
+        r.resolution_percentage = 100
+        r.film_transparent = True
+        r.image_settings.file_format = 'PNG'
+        r.image_settings.color_mode = 'RGBA'
+        sc.view_settings.view_transform = 'Standard'
+        sc.world = world
+        if world.node_tree is None: world.use_nodes = True
+        bg = world.node_tree.nodes.get('Background')
+        if bg: bg.inputs[0].default_value = (0.55, 0.58, 0.62, 1.0); bg.inputs[1].default_value = 0.6
+        sun_data.energy = 3.5
+        sun.rotation_euler = (radians(50), 0.0, radians(35))
+        sc.collection.objects.link(sun); sc.collection.objects.link(cam); sc.camera = cam
+        cam_data.lens = 50
+        view = Vector((1.0, -1.15, 0.75)).normalized()
+        for coll in colls:
+            inst = bpy.data.objects.new("Mjolnir Thumb Item", None)
+            inst.instance_type = 'COLLECTION'; inst.instance_collection = coll
+            sc.collection.objects.link(inst)
+            try:
+                lo, hi = collectionBounds(coll)
+                center, radius = (lo + hi) / 2, max((hi - lo).length / 2, 0.01)
+                dist = radius / sin(radians(18)) * 1.05
+                cam.location = center + view * dist
+                cam.rotation_euler = (-view).to_track_quat('-Z', 'Y').to_euler()
+                cam_data.clip_start = dist * 0.01; cam_data.clip_end = dist * 4
+                path = os.path.join(tmpdir, "thumb%d.png" % made)
+                if os.path.exists(path): os.remove(path)
+                r.filepath = path
+                try:
+                    bpy.ops.render.render(write_still=True, scene=sc.name)
+                    if not os.path.exists(path): raise RuntimeError("render produced no image")
+                except Exception as e:
+                    if r.engine == 'CYCLES': raise
+                    log("Thumbnail renderer %s failed (%s), switching to Cycles" % (r.engine, e))
+                    r.engine = 'CYCLES'; sc.cycles.samples = 16
+                    bpy.ops.render.render(write_still=True, scene=sc.name)
+                img = bpy.data.images.load(path, check_existing=False)
+                if tuple(img.size) != (THUMB_SIZE, THUMB_SIZE): img.scale(THUMB_SIZE, THUMB_SIZE)
+                try:
+                    px = np.empty(THUMB_SIZE * THUMB_SIZE * 4, np.float32)
+                    img.pixels.foreach_get(px)
+                finally:
+                    bpy.data.images.remove(img)
+                prev = coll.preview_ensure()
+                prev.image_size = (THUMB_SIZE, THUMB_SIZE)
+                prev.image_pixels_float.foreach_set(px)
+                k = THUMB_SIZE // THUMB_ICON
+                small = px.reshape(THUMB_ICON, k, THUMB_ICON, k, 4).mean(axis=(1, 3)).astype(np.float32)
+                prev.icon_size = (THUMB_ICON, THUMB_ICON)
+                prev.icon_pixels_float.foreach_set(small.ravel())
+                coll['mjolnir_thumb'] = THUMB_VERSION
+                made += 1
+            except Exception as e:
+                log("Thumbnail for '%s' failed: %s" % (coll.name, e))
+            finally:
+                bpy.data.objects.remove(inst)
+    finally:
+        bpy.data.scenes.remove(sc)
+        for ob in (cam, sun):
+            if ob.name in bpy.data.objects: bpy.data.objects.remove(ob)
+        bpy.data.cameras.remove(cam_data); bpy.data.lights.remove(sun_data); bpy.data.worlds.remove(world)
+        try:
+            import shutil; shutil.rmtree(tmpdir, ignore_errors=True)
+        except Exception: pass
+    return made
+
+def thumbnailNewModels(context, colls, log=print):
+    if colls and context.scene.forge.renderThumbnails:
+        try: return renderThumbnails(colls, log=log)
+        except Exception as e: log("Thumbnails skipped: %s" % e)
+    return 0
+
+class RenderMissingThumbnails(Operator):
+    """Render preview thumbnails for every palette item that doesn't have one yet (shown in the Add Forge Object search)"""
+    bl_idname = 'forge.render_missing_thumbnails'
+    bl_label = "Render Missing Thumbnails"
+    def execute(self, context):
+        t0 = time.time()
+        made = renderThumbnails([c for c, _ in paletteItems() if not hasThumbnail(c)])
+        self.report({'INFO'}, "Rendered %d thumbnails in %.1fs" % (made, time.time() - t0))
+        return {'FINISHED'}
+
+# ---- Add Forge Object search dialog: filtered list + preview of the selected item ----
+def searchTerms(text): return [t for t in text.lower().replace(',', ' ').split() if t]
+
+def refreshSearch(state, context=None):
+    terms = searchTerms(state.text)
+    current = state.items[state.index].coll if 0 <= state.index < len(state.items) else ""
+    state.items.clear()
+    byName, byCategory = [], []  # items whose name matches come first, then matches on their category
+    for coll, path in paletteItems():
+        name = coll.name.lower()
+        if all(t in name for t in terms): byName.append((coll, path))
+        elif all(t in name + " " + " ".join(path).lower() for t in terms): byCategory.append((coll, path))
+    for coll, path in byName + byCategory:
+            it = state.items.add()
+            it.name, it.coll = coll.name, coll.name
+            it.category = path[-1] if path else ""
+            it.path = " \u203a ".join(path)
+    names = [it.coll for it in state.items]
+    state.index = names.index(current) if current in names else (0 if names else -1)
+
+class ForgeSearchItem(bpy.types.PropertyGroup):
+    coll: StringProperty()
+    category: StringProperty()
+    path: StringProperty()
+
+class ForgeSearchState(bpy.types.PropertyGroup):
+    text: StringProperty(name="Search", default="", options={'TEXTEDIT_UPDATE'},
+        update=lambda self, context: refreshSearch(self, context))
+    items: CollectionProperty(type=ForgeSearchItem)
+    index: IntProperty(default=-1)
+
+class FORGE_UL_search(bpy.types.UIList):
+    def draw_item(self, context, layout, data, item, icon, active_data, active_propname, index):
+        coll = bpy.data.collections.get(item.coll)
+        row = layout.row(align=True)
+        if coll is not None and hasThumbnail(coll) and coll.preview.icon_id:
+            row.label(text=item.name, icon_value=coll.preview.icon_id)
+        else:
+            row.label(text=item.name, icon=(coll.forge.icon if coll is not None and coll.forge.icon != 'NONE' else 'MESH_CUBE'))
+        sub = row.row(); sub.alignment = 'RIGHT'; sub.enabled = False
+        sub.label(text=item.category)
+    def filter_items(self, context, data, propname):
+        return [], []  # filtering is done by the dialog's search field
+
+def describeType(name):
+    if palette['key'] is not None and name in palette['by_name']: return "0x%X" % palette['by_name'][name]
+    try: return "0x%X" % GetObjectTypeId('Forge World', name)
+    except Exception: return None
+
 class AddForgeObject(Operator):
     """Add forge object"""
     bl_idname = 'forge.add_object'
@@ -1847,13 +2039,49 @@ class AddForgeObject(Operator):
     bl_property = 'objectType'
 
     objectType: EnumProperty(name="Object Type", items=genObjectTypesEnum)
+    fromSearch: BoolProperty(default=False, options={'HIDDEN', 'SKIP_SAVE'})
     
     def invoke(self, context, event):
         fillIconDict(bpy.data.collections[mapPalette])
-        context.window_manager.invoke_search_popup(self)
-        return {'FINISHED'}
+        state = context.window_manager.forge_search
+        refreshSearch(state)
+        self.fromSearch = True
+        return context.window_manager.invoke_props_dialog(self, width=720, title="Add Forge Object", confirm_text="Add")
+    def draw(self, context):
+        state = context.window_manager.forge_search
+        layout = self.layout
+        split = layout.split(factor=0.56)
+        left = split.column()
+        left.prop(state, 'text', text="", icon='VIEWZOOM', placeholder="Search forge objects")
+        left.template_list('FORGE_UL_search', "", state, 'items', state, 'index', rows=12)
+        left.label(text="%d results" % len(state.items) if len(state.items) != 1 else "1 result")
+        right = split.column()
+        item = state.items[state.index] if 0 <= state.index < len(state.items) else None
+        coll = bpy.data.collections.get(item.coll) if item else None
+        box = right.box()
+        if coll is not None and hasThumbnail(coll):
+            box.template_icon(icon_value=coll.preview.icon_id, scale=12.0)
+        else:
+            inner = box.column(); inner.scale_y = 4.0
+            inner.label(text="No preview" if item else "Nothing found", icon='IMAGE_DATA')
+        if item:
+            right.label(text=item.name)
+            info = right.column(); info.enabled = False
+            if item.path: info.label(text=item.path)
+            tid = describeType(item.name)
+            src = ("extracted from %s" % coll.get('mjolnir_map', 'map')) if coll is not None and coll.get('mjolnir_type_id') is not None else "forge.blend"
+            info.label(text=("Forge ID %s  \u00b7  " % tid if tid else "") + "Mesh: " + src)
+        hint = layout.row(); hint.enabled = False
+        hint.label(text="Click an item to preview it  \u00b7  Enter or Add places it at the 3D cursor")
     def execute(self, context):
-        blobj = createForgeObject(context, self.objectType)
+        if self.fromSearch:
+            state = context.window_manager.forge_search
+            if not (0 <= state.index < len(state.items)):
+                self.report({'WARNING'}, "Nothing selected"); return {'CANCELLED'}
+            name = state.items[state.index].coll
+        else:
+            name = self.objectType
+        blobj = createForgeObject(context, name)
         blobj.location = context.scene.cursor.location
         for obj in bpy.context.selected_objects: obj.select_set(False)
         blobj.select_set(True)
@@ -1902,6 +2130,8 @@ class ForgeSceneProps(bpy.types.PropertyGroup):
         description="Read object types from the .map file MCC has loaded, so modded maps import correctly")
     extractModels: BoolProperty(name="Extract Missing Models", default=True,
         description="Build meshes from the .map for objects that have no model in this .blend")
+    renderThumbnails: BoolProperty(name="Render Thumbnails", default=True,
+        description="Render a preview of newly extracted models for the Add Forge Object search (about a second each)")
     importLevel: BoolProperty(name="Build Map Scene", default=True,
         description="Give each map a scene with its level geometry read from the .map, and show it as the backdrop of the scene you import into")
     extractTextures: BoolProperty(name="Extract Textures", default=True,
@@ -1933,7 +2163,9 @@ class ForgeScenePanel(bpy.types.Panel):
         col.prop(sceneProps, 'importLevel')
         col.prop(sceneProps, 'mapFileOverride')
         col.prop(sceneProps, 'extraMapFolders')
+        col.prop(sceneProps, 'renderThumbnails')
         col.operator(ExtractPaletteModels.bl_idname, icon='IMPORT')
+        col.operator(RenderMissingThumbnails.bl_idname, icon='IMAGE_DATA')
         if mapreader is None:
             box.label(text="mjolnir_mapreader.py not found", icon='ERROR')
         elif palette['path']:
@@ -1980,6 +2212,8 @@ class RotateForgeModel(Operator):
             for child in coll.objects:
                 child.rotation_euler.z += radians(self.degrees)
             coll['mjolnir_extra_rotation'] = coll.get('mjolnir_extra_rotation', 0.0) + self.degrees
+            coll['mjolnir_thumb'] = 0
+        thumbnailNewModels(context, [bpy.data.collections[n] for n in done])
         self.report({'INFO'}, "Rotated %s" % ", ".join(sorted(done)))
         return {'FINISHED'}
 def rotateModelMenuItem(self, context): self.layout.operator(RotateForgeModel.bl_idname, icon='DRIVER_ROTATIONAL_DIFFERENCE')
@@ -2000,12 +2234,15 @@ class ExtractPaletteModels(Operator):
         if not loadMapPalette(context, map_name):
             self.report({'ERROR'}, "Couldn't read palette: %s" % (palette['error'] or "disabled"))
             return {'CANCELLED'}
-        t0, made = time.time(), 0
+        t0, made, newColls = time.time(), 0, []
         upgradeMaterials()
         for type_id, name in palette['by_id'].items():
             coll = bpy.data.collections.get(name)
             if coll is not None and (coll.get('mjolnir_type_id') is None or coll.get('mjolnir_model_version', 1) >= MODEL_VERSION): continue
-            if ensureModelCollection(context, name, type_id) is not None: made += 1
+            newc = ensureModelCollection(context, name, type_id)
+            if newc is not None:
+                made += 1; newColls.append(newc)
+        thumbnailNewModels(context, newColls)
         self.report({'INFO'}, "Built %d models in %.1fs (see '%s' in the %s scene)" % (made, time.time() - t0, extractedCollName, propSceneName))
         return {'FINISHED'}
 
@@ -2050,8 +2287,9 @@ class ScaleObjects(Operator):
         return {'FINISHED'}
 
 reg_classes = [
-    ForgeObjectProps, ForgeCollectionProps, ForgeSceneProps,
+    ForgeObjectProps, ForgeCollectionProps, ForgeSceneProps, ForgeSearchItem, ForgeSearchState, FORGE_UL_search,
     ImportForgeObjects, ExportForgeObjects, AddForgeObject, ConvertForge, SetupArray, ErrorMessage, ScaleObjects, ExtractPaletteModels, RotateForgeModel,
+    RenderMissingThumbnails,
     ForgeObjectPanel, ForgeObjectPanel_Sidebar, AddForgeObjectMenu, ForgeCollectionPanel, ForgeScenePanel
 ]
 reg_objMenus = [convertForgeMenuItem, setupArrayMenuItem, rotateModelMenuItem]
@@ -2087,6 +2325,7 @@ def register():
     bpy.types.Object.forge = bpy.props.PointerProperty(type=ForgeObjectProps)
     bpy.types.Collection.forge = bpy.props.PointerProperty(type=ForgeCollectionProps)
     bpy.types.Scene.forge = bpy.props.PointerProperty(type=ForgeSceneProps)
+    bpy.types.WindowManager.forge_search = bpy.props.PointerProperty(type=ForgeSearchState)
     
     persist_vars['forgeObjectsOverlay_handle'] = bpy.types.SpaceView3D.draw_handler_add(draw_forgeObjectOverlay, (), 'WINDOW', 'POST_PIXEL')
     if persist_vars.get('gtIndexToLabel', None) == None: initGtLabels()
